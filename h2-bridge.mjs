@@ -2,6 +2,8 @@
 /**
  * Dumb HTTP/2 bidirectional pipe for Cursor gRPC.
  *
+ * Originally from https://github.com/ephraimduncan/opencode-cursor by Ephraim Duncan (MIT).
+ *
  * Bun's node:http2 is broken. This Node script acts as a transparent
  * HTTP/2 proxy: it opens a single bidirectional stream and ferries
  * raw bytes between the parent process (via stdin/stdout) and Cursor.

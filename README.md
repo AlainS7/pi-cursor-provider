@@ -23,7 +23,7 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 
 ```bash
 # Clone into pi's extensions directory
-git clone https://github.com/user/pi-cursor-provider ~/.pi/agent/extensions/cursor-provider
+git clone https://github.com/ndraiman/pi-cursor-provider ~/.pi/agent/extensions/cursor-provider
 cd ~/.pi/agent/extensions/cursor-provider
 npm install
 ```

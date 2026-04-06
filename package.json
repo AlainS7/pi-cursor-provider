@@ -1,8 +1,38 @@
 {
   "name": "pi-cursor-provider",
-  "private": true,
   "version": "0.1.0",
+  "description": "Pi extension providing access to Cursor models via OAuth and a local OpenAI-compatible gRPC proxy",
   "type": "module",
+  "license": "MIT",
+  "author": "Netanel Draiman",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ndraiman/pi-cursor-provider.git"
+  },
+  "homepage": "https://github.com/ndraiman/pi-cursor-provider#readme",
+  "bugs": {
+    "url": "https://github.com/ndraiman/pi-cursor-provider/issues"
+  },
+  "keywords": [
+    "pi",
+    "cursor",
+    "oauth",
+    "proxy",
+    "grpc",
+    "openai-compatible"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.ts",
+    "auth.ts",
+    "proxy.ts",
+    "h2-bridge.mjs",
+    "proto/agent_pb.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": ["./index.ts"]
   },
