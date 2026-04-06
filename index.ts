@@ -307,15 +307,19 @@ export default function (pi: ExtensionAPI) {
     return currentToken;
   });
 
+  const skipDedup = !!process.env.PI_CURSOR_RAW_MODELS;
+
   // Register with fallback models immediately so they appear in /model
   register(pi, 0, FALLBACK_MODELS);
   proxyReady.then((port) => {
     register(pi, port, FALLBACK_MODELS);
-  }).catch(() => {});
+  }).catch(() => {}); 
 
   function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
     const baseUrl = port > 0 ? `http://127.0.0.1:${port}/v1` : "http://localhost:1";
-    const processed = processModels(rawModels);
+    const processed = skipDedup
+      ? rawModels.map(m => ({ ...m, supportsEffort: false } as ProcessedModel))
+      : processModels(rawModels);
 
     pi.registerProvider("cursor", {
       baseUrl,

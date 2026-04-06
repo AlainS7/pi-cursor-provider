@@ -85,6 +85,14 @@ Models **not deduped** (kept as-is with effort baked into the ID):
 - No default/medium variant (e.g., `claude-4.6-opus-high` / `claude-4.6-opus-max`)
 - No effort at all (e.g., `composer-2`, `gemini-3.1-pro`, `kimi-k2.5`)
 
+### Disabling the mapping
+
+To see all raw Cursor model variants without dedup:
+
+```bash
+PI_CURSOR_RAW_MODELS=1 pi
+```
+
 ## Requirements
 
 - [Pi](https://github.com/badlogic/pi-mono)
