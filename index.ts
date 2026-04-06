@@ -87,6 +87,29 @@ function estimateModelCost(modelId: string): ModelCost {
   return MODEL_COST_PATTERNS.find((p) => p.match(normalized))?.cost ?? DEFAULT_COST;
 }
 
+const EFFORT_SUFFIXES = new Set(["low", "medium", "high"]);
+
+/** Strip trailing -low/-medium/-high from a Cursor model ID. */
+function stripEffortSuffix(id: string): string {
+  const lastDash = id.lastIndexOf("-");
+  if (lastDash < 0) return id;
+  const suffix = id.slice(lastDash + 1);
+  return EFFORT_SUFFIXES.has(suffix) ? id.slice(0, lastDash) : id;
+}
+
+/** Deduplicate models by stripping effort suffixes, keeping highest context/maxTokens. */
+function dedupeModels(models: CursorModel[]): CursorModel[] {
+  const byBase = new Map<string, CursorModel>();
+  for (const m of models) {
+    const baseId = stripEffortSuffix(m.id);
+    const existing = byBase.get(baseId);
+    if (!existing || m.contextWindow > existing.contextWindow || m.maxTokens > existing.maxTokens) {
+      byBase.set(baseId, { ...m, id: baseId });
+    }
+  }
+  return [...byBase.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
 function modelConfig(m: CursorModel) {
   return {
     id: m.id,
@@ -98,7 +121,14 @@ function modelConfig(m: CursorModel) {
     maxTokens: m.maxTokens,
     compat: {
       supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
+      supportsReasoningEffort: true,
+      reasoningEffortMap: {
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "high",
+      },
       maxTokensField: "max_tokens" as const,
     },
   };
@@ -109,10 +139,10 @@ function modelConfig(m: CursorModel) {
 const FALLBACK_MODELS: CursorModel[] = [
   { id: "composer-1", name: "Composer 1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-4.6-opus-high", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
-  { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.6-opus", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-sonnet", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "gpt-5.4-medium", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "gpt-5.4", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
   { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
   { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
   { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
@@ -163,7 +193,7 @@ export default function (pi: ExtensionAPI) {
           // Discover real models and re-register
           const realPort = await proxyReady;
           const discovered = await getCursorModels(accessToken);
-          register(pi, realPort, discovered);
+          register(pi, realPort, dedupeModels(discovered));
 
           return {
             refresh: refreshToken,
@@ -179,7 +209,7 @@ export default function (pi: ExtensionAPI) {
           // Discover real models on refresh too
           const realPort = await proxyReady;
           const discovered = await getCursorModels(refreshed.access);
-          register(pi, realPort, discovered);
+          register(pi, realPort, dedupeModels(discovered));
 
           return refreshed;
         },

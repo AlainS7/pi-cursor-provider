@@ -107,6 +107,7 @@ interface ChatCompletionRequest {
   max_tokens?: number;
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
+  reasoning_effort?: string;
 }
 
 interface CursorRequestPayload {
@@ -472,13 +473,30 @@ function evictStaleConversations(): void {
   }
 }
 
+/**
+ * Append reasoning effort as a Cursor model ID suffix.
+ * e.g. model="claude-4.6-opus" + reasoning_effort="high" → "claude-4.6-opus-high"
+ * If the model already has a suffix or no effort is specified, return as-is.
+ */
+const EFFORT_SUFFIXES = new Set(["low", "medium", "high"]);
+
+function resolveModelId(model: string, reasoningEffort?: string): string {
+  if (!reasoningEffort) return model;
+  const effort = reasoningEffort.toLowerCase();
+  if (!EFFORT_SUFFIXES.has(effort)) return model;
+  // Don't double-append if model already ends with a known suffix
+  const lastPart = model.split("-").pop();
+  if (lastPart && EFFORT_SUFFIXES.has(lastPart)) return model;
+  return `${model}-${effort}`;
+}
+
 async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
   res: ServerResponse,
 ): Promise<void> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
-  const modelId = body.model;
+  const modelId = resolveModelId(body.model, body.reasoning_effort);
   const tools = body.tools ?? [];
 
   if (!userText && toolResults.length === 0) {
