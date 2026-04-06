@@ -20,7 +20,7 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth.js";
-import { getCursorModels, startProxy, stopProxy, type CursorModel } from "./proxy.js";
+import { getCursorModels, startProxy, type CursorModel } from "./proxy.js";
 
 // ── Cost estimation ──
 
@@ -87,113 +87,108 @@ function estimateModelCost(modelId: string): ModelCost {
   return MODEL_COST_PATTERNS.find((p) => p.match(normalized))?.cost ?? DEFAULT_COST;
 }
 
-// ── Extension ──
-
-let proxyStarted = false;
-
-export default function (pi: ExtensionAPI) {
-  pi.registerProvider("cursor", {
-    baseUrl: "http://localhost:1", // placeholder, updated after proxy starts
-    apiKey: "cursor-proxy",
-    api: "openai-completions",
-    models: [], // populated dynamically after login
-    oauth: {
-      name: "Cursor",
-
-      async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-        const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
-        callbacks.onAuth({ url: loginUrl });
-
-        const { accessToken, refreshToken } = await pollCursorAuth(uuid, verifier);
-
-        // Discover models and start proxy
-        await initProxy(pi, accessToken);
-
-        return {
-          refresh: refreshToken,
-          access: accessToken,
-          expires: getTokenExpiry(accessToken),
-        };
-      },
-
-      async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-        const refreshed = await refreshCursorToken(credentials.refresh);
-
-        // Ensure proxy is running after token refresh
-        if (!proxyStarted) {
-          await initProxy(pi, refreshed.access);
-        }
-
-        return refreshed;
-      },
-
-      getApiKey(credentials: OAuthCredentials): string {
-        // Ensure proxy is initialized if not yet
-        if (!proxyStarted) {
-          initProxy(pi, credentials.access).catch(() => {});
-        }
-        return credentials.access;
-      },
+function modelConfig(m: CursorModel) {
+  return {
+    id: m.id,
+    name: m.name,
+    reasoning: m.reasoning,
+    input: ["text"] as ("text" | "image")[],
+    cost: estimateModelCost(m.id),
+    contextWindow: m.contextWindow,
+    maxTokens: m.maxTokens,
+    compat: {
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      maxTokensField: "max_tokens" as const,
     },
-  });
+  };
 }
 
-async function initProxy(pi: ExtensionAPI, accessToken: string): Promise<void> {
-  if (proxyStarted) return;
+// ── Fallback models (shown before model discovery) ──
 
-  // Discover available models
-  const cursorModels = await getCursorModels(accessToken);
+const FALLBACK_MODELS: CursorModel[] = [
+  { id: "composer-1", name: "Composer 1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.6-opus-high", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
+  { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
+  { id: "gpt-5.4-medium", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
+  { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
+  { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+];
 
-  // Start the local proxy
-  let currentToken = accessToken;
-  const port = await startProxy(async () => currentToken);
+// ── Extension ──
 
-  proxyStarted = true;
+export default function (pi: ExtensionAPI) {
+  // Current access token, updated by login/refresh/getApiKey
+  let currentToken = "";
 
-  // Re-register provider with actual models and proxy URL
-  pi.registerProvider("cursor", {
-    baseUrl: `http://127.0.0.1:${port}/v1`,
-    apiKey: "cursor-proxy",
-    api: "openai-completions",
-    models: cursorModels.map((m) => ({
-      id: m.id,
-      name: m.name,
-      reasoning: m.reasoning,
-      input: ["text"] as ("text" | "image")[],
-      cost: estimateModelCost(m.id),
-      contextWindow: m.contextWindow,
-      maxTokens: m.maxTokens,
-      compat: {
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: false,
-        maxTokensField: "max_tokens" as const,
-      },
-    })),
-    oauth: {
-      name: "Cursor",
-
-      async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-        const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
-        callbacks.onAuth({ url: loginUrl });
-        const { accessToken: newToken, refreshToken } = await pollCursorAuth(uuid, verifier);
-        currentToken = newToken;
-        return {
-          refresh: refreshToken,
-          access: newToken,
-          expires: getTokenExpiry(newToken),
-        };
-      },
-
-      async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-        const refreshed = await refreshCursorToken(credentials.refresh);
-        currentToken = refreshed.access;
-        return refreshed;
-      },
-
-      getApiKey(credentials: OAuthCredentials): string {
-        currentToken = credentials.access;
-        return "cursor-proxy"; // proxy handles auth internally
-      },
-    },
+  // Start proxy eagerly — it just binds a port, no auth needed until a request arrives.
+  // The getAccessToken callback reads currentToken at request time.
+  const proxyReady = startProxy(async () => {
+    if (!currentToken) throw new Error("Not logged in to Cursor. Run /login cursor");
+    return currentToken;
   });
+
+  // We don't have the port yet (async), so register with fallback models first.
+  // Once the proxy is ready, re-register with the real baseUrl.
+  proxyReady.then((port) => {
+    register(pi, port, FALLBACK_MODELS);
+  }).catch(() => {
+    // Proxy failed to start — models will show but requests will fail with a clear error
+  });
+
+  // Initial registration with placeholder baseUrl so models appear immediately
+  register(pi, 0, FALLBACK_MODELS);
+
+  function register(pi: ExtensionAPI, port: number, models: CursorModel[]) {
+    const baseUrl = port > 0 ? `http://127.0.0.1:${port}/v1` : "http://localhost:1";
+
+    pi.registerProvider("cursor", {
+      baseUrl,
+      apiKey: "cursor-proxy",
+      api: "openai-completions",
+      models: models.map(modelConfig),
+      oauth: {
+        name: "Cursor",
+
+        async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+          const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
+          callbacks.onAuth({ url: loginUrl });
+          const { accessToken, refreshToken } = await pollCursorAuth(uuid, verifier);
+          currentToken = accessToken;
+
+          // Discover real models and re-register
+          const realPort = await proxyReady;
+          const discovered = await getCursorModels(accessToken);
+          register(pi, realPort, discovered);
+
+          return {
+            refresh: refreshToken,
+            access: accessToken,
+            expires: getTokenExpiry(accessToken),
+          };
+        },
+
+        async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+          const refreshed = await refreshCursorToken(credentials.refresh);
+          currentToken = refreshed.access;
+
+          // Discover real models on refresh too
+          const realPort = await proxyReady;
+          const discovered = await getCursorModels(refreshed.access);
+          register(pi, realPort, discovered);
+
+          return refreshed;
+        },
+
+        getApiKey(credentials: OAuthCredentials): string {
+          currentToken = credentials.access;
+          return "cursor-proxy";
+        },
+      },
+    });
+  }
 }
