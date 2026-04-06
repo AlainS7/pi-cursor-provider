@@ -14,6 +14,7 @@
     "url": "https://github.com/ndraiman/pi-cursor-provider/issues"
   },
   "keywords": [
+    "pi-package",
     "pi",
     "cursor",
     "oauth",
@@ -21,6 +22,10 @@
     "grpc",
     "openai-compatible"
   ],
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
   "engines": {
     "node": ">=18"
   },
