@@ -327,7 +327,6 @@ export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
       if (decoded?.models?.length) {
         const models = normalizeCursorModels(decoded.models);
         if (models.length > 0) {
-          console.log(`[cursor-provider] Discovered ${models.length} models from Cursor API`);
           cachedModels = models;
           return models;
         }
@@ -1141,11 +1140,20 @@ function writeSSEStream(
             if (stored) { stored.checkpoint = checkpointBytes; stored.lastAccessMs = Date.now(); }
           },
         );
-      } catch {}
+      } catch (err) {
+        console.error("[cursor-provider] Stream message processing error:", err instanceof Error ? err.message : err);
+      }
     },
     (endStreamBytes) => {
       const endError = parseConnectEndStream(endStreamBytes);
-      if (endError) sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+      if (endError) {
+        console.error(`[cursor-provider] Cursor stream error (${modelId}):`, endError.message);
+        conversationStates.delete(convKey);
+        sendSSE(makeChunk({ content: endError.message }, "error"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeResponse();
+      }
     },
   );
 
@@ -1167,8 +1175,7 @@ function writeSSEStream(
       sendDone();
       closeResponse();
     } else if (code !== 0) {
-      sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-      sendSSE(makeChunk({}, "stop"));
+      sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
       sendSSE(makeUsageChunk());
       sendDone();
       closeResponse();
@@ -1239,6 +1246,7 @@ async function handleNonStreamingResponse(
   const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
+  let nonStreamError: Error | null = null;
 
   return new Promise((resolve) => {
     bridge.onData(createConnectFrameParser(
@@ -1260,9 +1268,18 @@ async function handleNonStreamingResponse(
               if (stored) { stored.checkpoint = checkpointBytes; stored.lastAccessMs = Date.now(); }
             },
           );
-        } catch {}
+        } catch (err) {
+          console.error("[cursor-provider] Non-stream message processing error:", err instanceof Error ? err.message : err);
+        }
       },
-      () => {},
+      (endStreamBytes) => {
+        const endError = parseConnectEndStream(endStreamBytes);
+        if (endError) {
+          console.error(`[cursor-provider] Cursor non-stream error (${modelId}):`, endError.message);
+          conversationStates.delete(convKey);
+          nonStreamError = endError;
+        }
+      },
     ));
 
     bridge.onClose(() => {
@@ -1272,6 +1289,16 @@ async function handleNonStreamingResponse(
         for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
         stored.lastAccessMs = Date.now();
       }
+
+      if (nonStreamError) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: { message: nonStreamError.message, type: "upstream_error", code: "cursor_error" },
+        }));
+        resolve();
+        return;
+      }
+
       const flushed = tagFilter.flush();
       fullText += flushed.content;
       const usage = computeUsage(state);
