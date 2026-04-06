@@ -29,9 +29,6 @@
   "engines": {
     "node": ">=18"
   },
-  "scripts": {
-    "publish:npm": "npm publish --access public"
-  },
   "files": [
     "index.ts",
     "auth.ts",
