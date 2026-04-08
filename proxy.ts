@@ -675,7 +675,7 @@ async function handleChatCompletion(
     debugLog("chat.resume_tool_results", { requestId, bridgeKey, toolResults, pendingExecs: activeBridge.pendingExecs });
     activeBridges.delete(bridgeKey);
     if (activeBridge.bridge.alive) {
-      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res, requestId);
+      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res, body.stream !== false, requestId);
       return;
     }
     clearInterval(activeBridge.heartbeatTimer);
@@ -775,6 +775,14 @@ function parseToolCallArguments(raw: string): Record<string, unknown> {
 
 function isToolCallStep(step: ParsedTurnStep): step is ParsedToolCallStep {
   return step.kind === "toolCall";
+}
+
+function getTurnToolCallResults(turn: ParsedTurn): Map<string, ParsedToolResult> {
+  const results = new Map<string, ParsedToolResult>();
+  for (const step of turn.steps) {
+    if (step.kind === "toolCall" && step.result) results.set(step.toolCallId, step.result);
+  }
+  return results;
 }
 
 function appendAssistantTextToTurn(turn: ParsedTurn, text: string): void {
@@ -920,12 +928,15 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let toolResults: ToolResultInfo[] = [];
 
   if (currentTurn) {
-    const isToolContinuation = currentTurn.sawToolResult && !currentTurn.sawAssistantAfterToolResult;
+    const toolCallSteps = currentTurn.steps.filter(isToolCallStep);
+    const hasAnyToolResults = toolCallSteps.some((step) => step.result);
+    const lastStep = currentTurn.steps.at(-1);
+    const isToolContinuation = lastStep?.kind === "toolCall";
+
     if (currentTurn.steps.length === 0 || isToolContinuation) {
       userText = currentTurn.userText;
-      if (isToolContinuation) {
-        toolResults = currentTurn.steps
-          .filter(isToolCallStep)
+      if (hasAnyToolResults) {
+        toolResults = toolCallSteps
           .filter((step) => step.result)
           .map((step) => ({ toolCallId: step.toolCallId, content: step.result!.content }));
       }
@@ -1496,6 +1507,63 @@ function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
+function respondWithPendingToolCalls(
+  modelId: string,
+  pendingExecs: PendingExec[],
+  stream: boolean,
+  res: ServerResponse,
+): void {
+  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
+  const created = Math.floor(Date.now() / 1000);
+  const toolCalls = pendingExecs.map((exec, index) => ({
+    index,
+    id: exec.toolCallId,
+    type: "function" as const,
+    function: { name: exec.toolName, arguments: exec.decodedArgs },
+  }));
+
+  if (stream) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    });
+    for (const toolCall of toolCalls) {
+      res.write(`data: ${JSON.stringify({
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model: modelId,
+        choices: [{ index: 0, delta: { tool_calls: [toolCall] }, finish_reason: null }],
+      })}\n\n`);
+    }
+    res.write(`data: ${JSON.stringify({
+      id: completionId,
+      object: "chat.completion.chunk",
+      created,
+      model: modelId,
+      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+    })}\n\n`);
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    id: completionId,
+    object: "chat.completion",
+    created,
+    model: modelId,
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: null, tool_calls: toolCalls },
+      finish_reason: "tool_calls",
+    }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  }));
+}
+
 // ── Streaming response ──
 
 function startBridge(accessToken: string, requestBytes: Uint8Array) {
@@ -1795,34 +1863,51 @@ function handleToolResultResume(
   completedTurns: ParsedTurn[],
   req: IncomingMessage,
   res: ServerResponse,
+  stream: boolean,
   requestId?: string,
 ): void {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
   debugLog("tool_resume.start", { requestId, bridgeKey, convKey, toolResults, pendingExecs, currentTurn });
 
-  for (const exec of pendingExecs) {
-    const result = toolResults.find((r) => r.toolCallId === exec.toolCallId);
-    const turnToolStep = currentTurn.steps.find((step) => step.kind === "toolCall" && step.toolCallId === exec.toolCallId);
-    if (turnToolStep && result) {
+  for (const result of toolResults) {
+    const turnToolStep = currentTurn.steps.find((step) => step.kind === "toolCall" && step.toolCallId === result.toolCallId);
+    if (turnToolStep) {
       turnToolStep.result = { content: result.content, isError: false };
     }
-    const mcpResult = result
-      ? create(McpResultSchema, {
-          result: {
-            case: "success",
-            value: create(McpSuccessSchema, {
-              content: [
-                create(McpToolResultContentItemSchema, {
-                  content: { case: "text", value: create(McpTextContentSchema, { text: result.content }) },
-                }),
-              ],
-              isError: false,
+  }
+
+  const turnResults = getTurnToolCallResults(currentTurn);
+  const unresolvedExecs = pendingExecs.filter((exec) => !turnResults.has(exec.toolCallId));
+  if (unresolvedExecs.length > 0) {
+    activeBridges.set(bridgeKey, {
+      bridge,
+      heartbeatTimer,
+      blobStore,
+      mcpTools,
+      pendingExecs,
+      currentTurn,
+    });
+    debugLog("tool_resume.partial_wait", { requestId, bridgeKey, unresolvedExecs, currentTurn });
+    respondWithPendingToolCalls(modelId, unresolvedExecs, stream, res);
+    return;
+  }
+
+  for (const exec of pendingExecs) {
+    const result = turnResults.get(exec.toolCallId);
+    if (!result) continue;
+    const mcpResult = create(McpResultSchema, {
+      result: {
+        case: "success",
+        value: create(McpSuccessSchema, {
+          content: [
+            create(McpToolResultContentItemSchema, {
+              content: { case: "text", value: create(McpTextContentSchema, { text: result.content }) },
             }),
-          },
-        })
-      : create(McpResultSchema, {
-          result: { case: "error", value: create(McpErrorSchema, { error: "Tool result not provided" }) },
-        });
+          ],
+          isError: false,
+        }),
+      },
+    });
 
     const execClientMessage = create(ExecClientMessageSchema, {
       id: exec.execMsgId,

@@ -972,6 +972,28 @@ describe("parseMessages — structured tool turns", () => {
     const next = parseMessages(nextMsgs);
     expect(next.turns.length).toBe(3);
   });
+
+  test("mixed resolved and unresolved tool calls stay in the in-flight turn", () => {
+    const parsed = parseMessages([
+      { role: "system" as const, content: "sys" },
+      { role: "user" as const, content: "review it" },
+      {
+        role: "assistant" as const,
+        content: "starting review",
+        tool_calls: [{ id: "t1", type: "function" as const, function: { name: "read", arguments: '{"path":"package.json"}' } }],
+      },
+      { role: "tool" as const, content: "pkg", tool_call_id: "t1" },
+      {
+        role: "assistant" as const,
+        content: "continuing review",
+        tool_calls: [{ id: "t2", type: "function" as const, function: { name: "read", arguments: '{"path":"README.md"}' } }],
+      },
+    ]);
+
+    expect(parsed.turns).toHaveLength(0);
+    expect(parsed.userText).toBe("review it");
+    expect(parsed.toolResults).toEqual([{ toolCallId: "t1", content: "pkg" }]);
+  });
 });
 
 function frameConnectMessageForTest(data: Uint8Array, flags = 0): Buffer {
@@ -1210,6 +1232,108 @@ describe("proxy integration — session handling", () => {
       turn("inspect file", [
         toolStep("tc1", "read", { path: "README.md" }, { content: "README contents", isError: false }),
         assistantStep("I found the issue."),
+      ]),
+    ]));
+  });
+
+  test("partial tool-result batches stay in-flight until all pending tool results arrive", async () => {
+    const execClientMessages: any[] = [];
+    const sessionId = "session-partial-tools";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-partial-tools",
+      checkpoint: null,
+      checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
+      if (clientMessage.message.case === "execClientMessage") {
+        execClientMessages.push(clientMessage.message.value);
+        if (execClientMessages.length === 2) {
+          setTimeout(() => {
+            fake.emitServerMessage(makeTextDeltaMessage("final review"));
+            fake.emitServerMessage(makeCheckpointMessage());
+            fake.close(0);
+          }, 0);
+        }
+      }
+    });
+
+    __testInternals.activeBridges.set(bridgeKey, {
+      bridge: bridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: [
+        { execId: "exec-1", execMsgId: 1, toolCallId: "tc1", toolName: "read", decodedArgs: '{"path":"package.json"}' },
+        { execId: "exec-2", execMsgId: 2, toolCallId: "tc2", toolName: "read", decodedArgs: '{"path":"README.md"}' },
+      ],
+      currentTurn: turn("review it", [
+        assistantStep("starting review"),
+        toolStep("tc1", "read", { path: "package.json" }),
+        assistantStep("continuing review"),
+        toolStep("tc2", "read", { path: "README.md" }),
+      ]),
+    });
+
+    const port = await startProxy(async () => "test-token");
+
+    const partial = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "user", content: "review it" },
+        { role: "assistant", content: "starting review", tool_calls: [{ id: "tc1", type: "function", function: { name: "read", arguments: '{"path":"package.json"}' } }] },
+        { role: "tool", content: "pkg", tool_call_id: "tc1" },
+        { role: "assistant", content: "continuing review", tool_calls: [{ id: "tc2", type: "function", function: { name: "read", arguments: '{"path":"README.md"}' } }] },
+      ],
+    });
+
+    expect(partial.statusCode).toBe(200);
+    expect(partial.body).toContain('"finish_reason":"tool_calls"');
+    expect(partial.body).toContain('"id":"tc2"');
+    expect(partial.body).not.toContain('"id":"tc1"');
+    expect(execClientMessages).toHaveLength(0);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+    const partialBridge = __testInternals.activeBridges.get(bridgeKey);
+    const partialT1 = partialBridge?.currentTurn.steps.find((step) => step.kind === "toolCall" && step.toolCallId === "tc1");
+    expect(partialT1 && partialT1.kind === "toolCall" ? partialT1.result?.content : undefined).toBe("pkg");
+
+    const complete = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "user", content: "review it" },
+        { role: "assistant", content: "starting review", tool_calls: [{ id: "tc1", type: "function", function: { name: "read", arguments: '{"path":"package.json"}' } }] },
+        { role: "tool", content: "pkg", tool_call_id: "tc1" },
+        { role: "assistant", content: "continuing review", tool_calls: [{ id: "tc2", type: "function", function: { name: "read", arguments: '{"path":"README.md"}' } }] },
+        { role: "tool", content: "readme", tool_call_id: "tc2" },
+      ],
+    });
+
+    expect(complete.statusCode).toBe(200);
+    expect(complete.body).toContain("final review");
+    expect(execClientMessages).toHaveLength(2);
+    expect(execClientMessages.map((m) => m.execId)).toEqual(["exec-1", "exec-2"]);
+    expect(execClientMessages.every((m) => m.message.case === "mcpResult" && m.message.value.result.case === "success")).toBe(true);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+
+    const stored = __testInternals.conversationStates.get(convKey);
+    expect(stored?.checkpoint).toBeTruthy();
+    expect(stored?.checkpointTurnCount).toBe(1);
+    expect(stored?.checkpointHistoryFingerprint).toBe(buildCompletedHistoryFingerprint([
+      turn("review it", [
+        assistantStep("starting review"),
+        toolStep("tc1", "read", { path: "package.json" }, { content: "pkg", isError: false }),
+        assistantStep("continuing review"),
+        toolStep("tc2", "read", { path: "README.md" }, { content: "readme", isError: false }),
+        assistantStep("final review"),
       ]),
     ]));
   });
