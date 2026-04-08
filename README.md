@@ -99,26 +99,55 @@ PI_CURSOR_RAW_MODELS=1 pi
 
 ## Session Management
 
-The proxy maintains conversation state per pi session, enabling multi-turn conversations with Cursor models.
+The proxy maintains conversation state per pi session, enabling multi-turn conversations with Cursor models while preserving forks, tool continuations, and interruptions correctly.
 
 ### How it works
 
-- **Session tracking** — pi's session ID is injected into requests via a `before_provider_request` hook. The proxy uses it to maintain a stable conversation with Cursor across turns (checkpoint, blob store, conversation ID).
-- **Checkpoints** — Cursor returns a conversation checkpoint after each turn. The proxy stores it and sends it back on subsequent requests, so the model sees full conversation history without re-sending all messages.
+- **Session tracking** — pi's session ID is injected into requests via a `before_provider_request` hook. The proxy keys bridge state and stored conversation state from that real session ID.
+- **Checkpoints** — Cursor returns a conversation checkpoint after completed turns. The proxy stores that checkpoint, plus the completed-turn count and a fingerprint of the completed structured history, and reuses it only when the incoming history still matches.
+- **Session-scoped state** — real pi session state is kept in memory until explicit cleanup or process restart. Anonymous fallback state can still be TTL-evicted.
+- **Lifecycle cleanup** — session state is cleaned up on pi lifecycle events such as session switch, fork, `/tree`, and shutdown.
+
+### Tool continuations
+
+When Cursor pauses for a tool call, the proxy keeps the live upstream bridge open and waits for pi to send the tool result on the next request. That tool result is sent back into the same in-flight Cursor run, so the tool continuation stays part of the original user turn instead of inflating completed history.
+
+### Interruptions
+
+If the client disconnects or interrupts a turn mid-stream, the proxy cancels the upstream Cursor run and does **not** commit the pending checkpoint. Checkpoints are only committed after a turn finishes successfully.
 
 ### Session fork
 
-When you navigate back in pi's session tree and branch from an earlier point, the proxy detects the fork (turn count mismatch vs checkpoint) and discards the checkpoint. It then reconstructs proper protobuf conversation turns from the message history pi sends, so the model sees the real conversation structure up to the fork point.
+When you navigate back in pi's session tree and branch from an earlier point, the proxy discards the stored checkpoint whenever the completed history no longer matches the stored checkpoint metadata. That includes both:
+
+- completed turn count mismatches, and
+- same-depth branch changes detected via completed-history fingerprint mismatch.
+
+After discarding a stale checkpoint, the proxy reconstructs proper protobuf conversation turns from the message history pi sends, so Cursor sees the actual conversation structure at the fork point.
 
 ### Session resume
 
-Conversation state is stored in memory. If the proxy restarts (pi restart), checkpoints are lost. On the next request, pi sends the full conversation history, which the proxy reconstructs as proper protobuf turns — the model sees real conversation structure, not inlined text.
+Conversation state is stored in memory. If the proxy restarts, checkpoints are lost. On the next request, pi sends the full conversation history, and the proxy reconstructs structured protobuf turns from that history instead of relying on an inline plaintext fallback.
+
+That reconstruction preserves:
+
+- assistant messages
+- tool calls
+- tool results
+- final assistant text after tool results
 
 ## Requirements
 
 - [Pi](https://github.com/badlogic/pi-mono)
-- [Node.js](https://nodejs.org) >= 18 (for the HTTP/2 bridge)
+- [Node.js](https://nodejs.org) >= 18
 - Active [Cursor](https://cursor.com) subscription
+
+## Development
+
+```bash
+npm install
+npm test
+```
 
 ## Credits
 

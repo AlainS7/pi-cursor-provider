@@ -12,7 +12,7 @@
  * Based on https://github.com/ephraimduncan/opencode-cursor by Ephraim Duncan.
  */
 
-import rawFallbackModels from "./cursor-models-raw.json" with { type: "json" };
+import rawFallbackModels from "./cursor-models-raw.json";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
 import {

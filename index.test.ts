@@ -1,5 +1,5 @@
-import rawModels from "./cursor-models-raw.json" with { type: "json" };
-import { afterEach, describe, expect, test } from "bun:test";
+import rawModels from "./cursor-models-raw.json";
+import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
 import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
