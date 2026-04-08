@@ -9,7 +9,9 @@ import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { resolve as pathResolve, dirname } from "node:path";
+import { appendFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   AgentClientMessageSchema,
@@ -213,6 +215,79 @@ const activeBridges = new Map<string, ActiveBridge>();
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 let bridgeFactory: BridgeFactory = spawnBridge;
+let debugRequestCounter = 0;
+let debugLogFilePath: string | undefined;
+
+function isProxyDebugEnabled(): boolean {
+  const raw = process.env.PI_CURSOR_PROVIDER_DEBUG?.trim().toLowerCase();
+  return !!raw && raw !== "0" && raw !== "false" && raw !== "off";
+}
+
+function truncateDebugString(value: string, max = 4000): string {
+  return value.length > max ? `${value.slice(0, max)}…<truncated ${value.length - max} chars>` : value;
+}
+
+function sanitizeForDebug(value: unknown): unknown {
+  if (value == null) return value;
+  if (typeof value === "string") return truncateDebugString(value);
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
+    const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+    return {
+      __type: value instanceof Uint8Array ? "Uint8Array" : "Buffer",
+      byteLength: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex").slice(0, 16),
+    };
+  }
+  if (Array.isArray(value)) return value.map((item) => sanitizeForDebug(item));
+  if (value instanceof Map) {
+    return {
+      __type: "Map",
+      size: value.size,
+      entries: Array.from(value.entries()).slice(0, 20).map(([k, v]) => [sanitizeForDebug(k), sanitizeForDebug(v)]),
+    };
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).map(([key, inner]) => {
+      if (key === "accessToken") return [key, "<redacted>"] as const;
+      if (key === "data" && typeof inner === "string") return [key, `<redacted base64 ${inner.length} chars>`] as const;
+      return [key, sanitizeForDebug(inner)] as const;
+    });
+    return Object.fromEntries(entries);
+  }
+  return String(value);
+}
+
+function getDebugLogFilePath(): string {
+  const configured = process.env.PI_CURSOR_PROVIDER_DEBUG_FILE?.trim();
+  if (configured) return configured;
+  if (debugLogFilePath) return debugLogFilePath;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  debugLogFilePath = pathJoin(tmpdir(), `pi-cursor-provider-debug-${stamp}-${process.pid}.log`);
+  return debugLogFilePath;
+}
+
+function debugLog(event: string, data?: Record<string, unknown>): void {
+  if (!isProxyDebugEnabled()) return;
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    pid: process.pid,
+    event,
+    ...(data ? sanitizeForDebug(data) : {}),
+  });
+  const file = getDebugLogFilePath();
+  try {
+    appendFileSync(file, `${line}\n`, "utf8");
+  } catch (error) {
+    console.error("[pi-cursor-provider] failed to write debug log", error);
+    console.error(`[pi-cursor-provider] ${line}`);
+  }
+}
+
+function nextDebugRequestId(): string {
+  debugRequestCounter += 1;
+  return `req-${debugRequestCounter}`;
+}
 
 export const __testInternals = {
   activeBridges,
@@ -252,6 +327,7 @@ interface SpawnBridgeOptions {
 }
 
 function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
+  debugLog("bridge.spawn", { rpcPath: options.rpcPath, url: options.url ?? CURSOR_API_URL, unary: options.unary ?? false });
   const proc = spawn("node", [BRIDGE_PATH], {
     stdio: ["pipe", "pipe", "ignore"],
   });
@@ -287,6 +363,7 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
   proc.on("exit", (code) => {
     exited = true;
     exitCode = code ?? 1;
+    debugLog("bridge.exit", { rpcPath: options.rpcPath, exitCode });
     cbs.close?.(exitCode);
   });
 
@@ -447,6 +524,8 @@ export async function startProxy(
   return new Promise((resolve, reject) => {
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? "/", `http://localhost`);
+      const requestId = nextDebugRequestId();
+      debugLog("http.request", { requestId, method: req.method, pathname: url.pathname, headers: req.headers });
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -458,11 +537,13 @@ export async function startProxy(
         try {
           const body = await readBody(req);
           const parsed = JSON.parse(body) as ChatCompletionRequest;
+          debugLog("http.chat.body", { requestId, body: parsed });
           if (!proxyAccessTokenProvider) throw new Error("No access token provider");
           const accessToken = await proxyAccessTokenProvider();
-          await handleChatCompletion(parsed, accessToken, req, res);
+          await handleChatCompletion(parsed, accessToken, req, res, requestId);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          debugLog("http.chat.error", { requestId, message, stack: err instanceof Error ? err.stack : undefined });
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: { message, type: "server_error", code: "internal_error" } }));
         }
@@ -478,6 +559,7 @@ export async function startProxy(
       if (typeof addr === "object" && addr) {
         proxyPort = addr.port;
         proxyServer = server;
+        debugLog("proxy.start", { port: proxyPort, debugLogFile: isProxyDebugEnabled() ? getDebugLogFilePath() : undefined });
         resolve(proxyPort);
       } else {
         reject(new Error("Failed to bind proxy"));
@@ -487,6 +569,7 @@ export async function startProxy(
 }
 
 export function cleanupAllSessionState(): void {
+  debugLog("session.cleanup_all", { activeBridgeCount: activeBridges.size, conversationCount: conversationStates.size });
   for (const [bridgeKey, active] of activeBridges) {
     cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
   }
@@ -494,6 +577,7 @@ export function cleanupAllSessionState(): void {
 }
 
 export function stopProxy(): void {
+  debugLog("proxy.stop", { port: proxyPort });
   if (proxyServer) {
     proxyServer.close();
     proxyServer = undefined;
@@ -517,6 +601,7 @@ function readBody(req: IncomingMessage): Promise<string> {
 export function evictStaleConversations(now = Date.now()): void {
   for (const [key, stored] of conversationStates) {
     if (!stored.sessionScoped && now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
+      debugLog("conversation.evict", { key, stored, now });
       conversationStates.delete(key);
     }
   }
@@ -549,12 +634,26 @@ async function handleChatCompletion(
   accessToken: string,
   req: IncomingMessage,
   res: ServerResponse,
+  requestId: string,
 ): Promise<void> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = resolveModelId(body.model, body.reasoning_effort);
   const tools = body.tools ?? [];
 
+  debugLog("chat.parsed_messages", {
+    requestId,
+    systemPrompt,
+    userText,
+    turns,
+    toolResults,
+    messageCount: body.messages.length,
+    model: body.model,
+    resolvedModelId: modelId,
+    stream: body.stream !== false,
+  });
+
   if (!userText && toolResults.length === 0) {
+    debugLog("chat.no_user_message", { requestId, messages: body.messages });
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: "No user message found", type: "invalid_request_error" } }));
     return;
@@ -564,11 +663,19 @@ async function handleChatCompletion(
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
   const activeBridge = activeBridges.get(bridgeKey);
+  debugLog("chat.session_keys", {
+    requestId,
+    sessionId,
+    bridgeKey,
+    convKey,
+    hasActiveBridge: !!activeBridge,
+  });
 
   if (activeBridge && toolResults.length > 0) {
+    debugLog("chat.resume_tool_results", { requestId, bridgeKey, toolResults, pendingExecs: activeBridge.pendingExecs });
     activeBridges.delete(bridgeKey);
     if (activeBridge.bridge.alive) {
-      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res);
+      handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, turns, req, res, requestId);
       return;
     }
     clearInterval(activeBridge.heartbeatTimer);
@@ -582,6 +689,7 @@ async function handleChatCompletion(
   }
 
   let stored = conversationStates.get(convKey);
+  debugLog("chat.stored_state.before", { requestId, convKey, stored });
   if (!stored) {
     stored = {
       conversationId: deterministicConversationId(convKey),
@@ -600,6 +708,14 @@ async function handleChatCompletion(
   // Discard checkpoints whenever the completed-history fingerprint no longer matches.
   // This covers both turn-count mismatches and same-depth branch switches.
   if (shouldDiscardStoredCheckpoint(stored, turns)) {
+    debugLog("chat.discard_checkpoint", {
+      requestId,
+      convKey,
+      checkpointTurnCount: stored.checkpointTurnCount,
+      checkpointHistoryFingerprint: stored.checkpointHistoryFingerprint,
+      incomingTurnCount: turns.length,
+      incomingHistoryFingerprint: buildCompletedHistoryFingerprint(turns),
+    });
     stored.checkpoint = null;
     stored.checkpointTurnCount = 0;
     stored.checkpointHistoryFingerprint = null;
@@ -613,6 +729,14 @@ async function handleChatCompletion(
     modelId, systemPrompt, effectiveUserText, turns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
+  debugLog("chat.cursor_request", {
+    requestId,
+    conversationId: stored.conversationId,
+    effectiveUserText,
+    turnCount: turns.length,
+    hasCheckpoint: !!stored.checkpoint,
+    payload,
+  });
   payload.mcpTools = mcpTools;
 
   const currentTurn: ParsedTurn = {
@@ -621,9 +745,11 @@ async function handleChatCompletion(
   };
 
   if (body.stream === false) {
-    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turns, currentTurn, req, res);
+    debugLog("chat.dispatch_nonstream", { requestId, convKey });
+    await handleNonStreamingResponse(payload, accessToken, modelId, convKey, turns, currentTurn, req, res, requestId);
   } else {
-    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res);
+    debugLog("chat.dispatch_stream", { requestId, bridgeKey, convKey });
+    handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, turns, currentTurn, req, res, requestId);
   }
 }
 
@@ -716,6 +842,8 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const turns: ParsedTurn[] = [];
 
+  debugLog("parse_messages.start", { messages });
+
   const systemParts = messages.filter((m) => m.role === "system").map((m) => textContent(m.content));
   if (systemParts.length > 0) systemPrompt = systemParts.join("\n");
 
@@ -806,7 +934,9 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     }
   }
 
-  return { systemPrompt, userText, turns, toolResults };
+  const parsed = { systemPrompt, userText, turns, toolResults };
+  debugLog("parse_messages.end", parsed);
+  return parsed;
 }
 
 // ── Tool definitions ──
@@ -924,6 +1054,15 @@ export function buildCursorRequest(
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
 ): CursorRequestPayload {
+  debugLog("cursor_request.build.start", {
+    modelId,
+    systemPrompt,
+    userText,
+    turns,
+    conversationId,
+    checkpoint,
+    existingBlobStore,
+  });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
   const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
@@ -980,7 +1119,9 @@ export function buildCursorRequest(
     message: { case: "runRequest", value: runRequest },
   });
 
-  return { requestBytes: toBinary(AgentClientMessageSchema, clientMessage), blobStore, mcpTools: [] };
+  const payload = { requestBytes: toBinary(AgentClientMessageSchema, clientMessage), blobStore, mcpTools: [] };
+  debugLog("cursor_request.build.end", payload);
+  return payload;
 }
 
 // ── Server message processing ──
@@ -996,6 +1137,7 @@ function processServerMessage(
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
 ): void {
   const msgCase = msg.message.case;
+  debugLog("server_message", { msgCase, msg });
 
   if (msgCase === "interactionUpdate") {
     const update = msg.message.value as any;
@@ -1250,6 +1392,7 @@ export function cleanupSessionState(sessionId?: string): void {
   const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
   const convKey = deriveConversationKeyFromSessionId(sessionId);
   const active = activeBridges.get(bridgeKey);
+  debugLog("session.cleanup", { sessionId, bridgeKey, convKey, hasActiveBridge: !!active, hadConversation: conversationStates.has(convKey) });
   if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
   conversationStates.delete(convKey);
 }
@@ -1357,6 +1500,7 @@ function computeUsage(state: StreamState) {
 
 function startBridge(accessToken: string, requestBytes: Uint8Array) {
   const bridge = bridgeFactory({ accessToken, rpcPath: "/agent.v1.AgentService/Run" });
+  debugLog("bridge.start_run", { requestBytes });
   bridge.write(frameConnectMessage(requestBytes));
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
   return { bridge, heartbeatTimer };
@@ -1372,7 +1516,9 @@ function handleStreamingResponse(
   currentTurn: ParsedTurn,
   req: IncomingMessage,
   res: ServerResponse,
+  requestId: string,
 ): void {
+  debugLog("stream.start", { requestId, bridgeKey, convKey, modelId });
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   writeSSEStream(
     bridge,
@@ -1386,12 +1532,14 @@ function handleStreamingResponse(
     currentTurn,
     req,
     res,
+    requestId,
   );
 }
 
 function sendCancelAction(
   bridge: BridgeHandle,
 ): void {
+  debugLog("bridge.cancel_action", {});
   const action = create(ConversationActionSchema, {
     action: { case: "cancelAction", value: create(CancelActionSchema, {}) },
   });
@@ -1406,6 +1554,7 @@ function cleanupBridge(
   heartbeatTimer: ReturnType<typeof setInterval>,
   bridgeKey: string,
 ): void {
+  debugLog("bridge.cleanup", { bridgeKey, alive: bridge.alive });
   clearInterval(heartbeatTimer);
   if (bridge.alive) {
     sendCancelAction(bridge);
@@ -1426,7 +1575,9 @@ function writeSSEStream(
   currentTurn: ParsedTurn,
   req: IncomingMessage,
   res: ServerResponse,
+  requestId?: string,
 ): void {
+  debugLog("stream.writer_start", { requestId, bridgeKey, convKey, modelId, completedTurnCount: completedTurns.length, currentTurn });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -1477,6 +1628,7 @@ function writeSSEStream(
   // Detect client disconnect (e.g. user pressed Escape in pi)
   const onClientClose = () => {
     if (cancelled || closed) return;
+    debugLog("stream.client_close", { requestId, bridgeKey, convKey });
     cancelled = true;
     cleanupBridge(bridge, heartbeatTimer, bridgeKey);
     closeResponse();
@@ -1533,6 +1685,7 @@ function writeSSEStream(
             activeBridges.set(bridgeKey, {
               bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
             });
+            debugLog("stream.tool_call_pause", { requestId, bridgeKey, exec, pendingExecs: state.pendingExecs, currentTurn });
 
             sendSSE(makeChunk({}, "tool_calls"));
             sendDone();
@@ -1540,6 +1693,7 @@ function writeSSEStream(
           },
           (checkpointBytes) => {
             pendingCheckpoint = checkpointBytes;
+            debugLog("stream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
           },
         );
       } catch (err) {
@@ -1562,6 +1716,7 @@ function writeSSEStream(
   bridge.onData(processChunk);
 
   bridge.onClose((code) => {
+    debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, mcpExecReceived, currentTurn, pendingCheckpoint });
     clearInterval(heartbeatTimer);
     req.removeListener("close", onClientClose);
     res.removeListener("close", onClientClose);
@@ -1574,6 +1729,7 @@ function writeSSEStream(
         stored.checkpoint = pendingCheckpoint;
         stored.checkpointTurnCount = completedTurns.length + 1;
         stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint([...completedTurns, currentTurn]);
+        debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
       }
     }
     if (cancelled) return;
@@ -1610,6 +1766,7 @@ export function writeSSEStreamForTests(args: {
   currentTurn: ParsedTurn;
   req: IncomingMessage;
   res: ServerResponse;
+  requestId?: string;
 }): void {
   writeSSEStream(
     args.bridge,
@@ -1623,6 +1780,7 @@ export function writeSSEStreamForTests(args: {
     args.currentTurn,
     args.req,
     args.res,
+    args.requestId,
   );
 }
 
@@ -1637,8 +1795,10 @@ function handleToolResultResume(
   completedTurns: ParsedTurn[],
   req: IncomingMessage,
   res: ServerResponse,
+  requestId?: string,
 ): void {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
+  debugLog("tool_resume.start", { requestId, bridgeKey, convKey, toolResults, pendingExecs, currentTurn });
 
   for (const exec of pendingExecs) {
     const result = toolResults.find((r) => r.toolCallId === exec.toolCallId);
@@ -1673,6 +1833,7 @@ function handleToolResultResume(
       message: { case: "execClientMessage", value: execClientMessage },
     });
     bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+    debugLog("tool_resume.sent_result", { requestId, exec, result });
   }
 
   // Tool results belong to the same user turn that initiated the tool calls.
@@ -1690,6 +1851,7 @@ function handleToolResultResume(
     currentTurn,
     req,
     res,
+    requestId,
   );
 }
 
@@ -1704,7 +1866,9 @@ async function handleNonStreamingResponse(
   currentTurn: ParsedTurn,
   req: IncomingMessage,
   res: ServerResponse,
+  requestId?: string,
 ): Promise<void> {
+  debugLog("nonstream.start", { requestId, convKey, modelId, currentTurn, completedTurnCount: completedTurns.length });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -1713,6 +1877,7 @@ async function handleNonStreamingResponse(
 
   const onClientClose = () => {
     if (cancelled) return;
+    debugLog("nonstream.client_close", { requestId, convKey });
     cancelled = true;
     clearInterval(heartbeatTimer);
     if (bridge.alive) {
@@ -1746,6 +1911,7 @@ async function handleNonStreamingResponse(
             () => {},
             (checkpointBytes) => {
               pendingCheckpoint = checkpointBytes;
+              debugLog("nonstream.checkpoint_buffered", { requestId, convKey, checkpointBytes });
             },
           );
         } catch (err) {
@@ -1763,6 +1929,7 @@ async function handleNonStreamingResponse(
     ));
 
     bridge.onClose(() => {
+      debugLog("nonstream.bridge_close", { requestId, convKey, cancelled, nonStreamError: nonStreamError?.message, currentTurn, pendingCheckpoint });
       clearInterval(heartbeatTimer);
       req.removeListener("close", onClientClose);
       res.removeListener("close", onClientClose);
@@ -1774,6 +1941,7 @@ async function handleNonStreamingResponse(
           stored.checkpoint = pendingCheckpoint;
           stored.checkpointTurnCount = completedTurns.length + 1;
           stored.checkpointHistoryFingerprint = buildCompletedHistoryFingerprint([...completedTurns, currentTurn]);
+          debugLog("nonstream.checkpoint_committed", { requestId, convKey, stored });
         }
       }
 
