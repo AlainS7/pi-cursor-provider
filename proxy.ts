@@ -132,8 +132,19 @@ interface PendingExec {
   decodedArgs: string;
 }
 
+interface BridgeHandle {
+  proc: Pick<ChildProcess, "kill">;
+  readonly alive: boolean;
+  write(data: Uint8Array): void;
+  end(): void;
+  onData(cb: (chunk: Buffer) => void): void;
+  onClose(cb: (code: number) => void): void;
+}
+
+export type BridgeFactory = (options: SpawnBridgeOptions) => BridgeHandle;
+
 interface ActiveBridge {
-  bridge: ReturnType<typeof spawnBridge>;
+  bridge: BridgeHandle;
   heartbeatTimer: ReturnType<typeof setInterval>;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
@@ -201,11 +212,16 @@ interface ParsedMessages {
 const activeBridges = new Map<string, ActiveBridge>();
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
+let bridgeFactory: BridgeFactory = spawnBridge;
 
 export const __testInternals = {
   activeBridges,
   conversationStates,
 };
+
+export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
+  bridgeFactory = factory ?? spawnBridge;
+}
 
 let proxyServer: ReturnType<typeof createServer> | undefined;
 let proxyPort: number | undefined;
@@ -235,7 +251,7 @@ interface SpawnBridgeOptions {
   unary?: boolean;
 }
 
-function spawnBridge(options: SpawnBridgeOptions) {
+function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
   const proc = spawn("node", [BRIDGE_PATH], {
     stdio: ["pipe", "pipe", "ignore"],
   });
@@ -306,7 +322,7 @@ export async function callCursorUnaryRpc(options: {
   url?: string;
   timeoutMs?: number;
 }): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
-  const bridge = spawnBridge({
+  const bridge = bridgeFactory({
     accessToken: options.accessToken,
     rpcPath: options.rpcPath,
     url: options.url,
@@ -1340,7 +1356,7 @@ function computeUsage(state: StreamState) {
 // ── Streaming response ──
 
 function startBridge(accessToken: string, requestBytes: Uint8Array) {
-  const bridge = spawnBridge({ accessToken, rpcPath: "/agent.v1.AgentService/Run" });
+  const bridge = bridgeFactory({ accessToken, rpcPath: "/agent.v1.AgentService/Run" });
   bridge.write(frameConnectMessage(requestBytes));
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
   return { bridge, heartbeatTimer };
@@ -1374,7 +1390,7 @@ function handleStreamingResponse(
 }
 
 function sendCancelAction(
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: BridgeHandle,
 ): void {
   const action = create(ConversationActionSchema, {
     action: { case: "cancelAction", value: create(CancelActionSchema, {}) },
@@ -1386,7 +1402,7 @@ function sendCancelAction(
 }
 
 function cleanupBridge(
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: BridgeHandle,
   heartbeatTimer: ReturnType<typeof setInterval>,
   bridgeKey: string,
 ): void {
@@ -1399,7 +1415,7 @@ function cleanupBridge(
 }
 
 function writeSSEStream(
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: BridgeHandle,
   heartbeatTimer: ReturnType<typeof setInterval>,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
@@ -1580,6 +1596,34 @@ function writeSSEStream(
       activeBridges.delete(bridgeKey);
     }
   });
+}
+
+export function writeSSEStreamForTests(args: {
+  bridge: BridgeHandle;
+  heartbeatTimer: ReturnType<typeof setInterval>;
+  blobStore?: Map<string, Uint8Array>;
+  mcpTools?: McpToolDefinition[];
+  modelId: string;
+  bridgeKey: string;
+  convKey: string;
+  completedTurns: ParsedTurn[];
+  currentTurn: ParsedTurn;
+  req: IncomingMessage;
+  res: ServerResponse;
+}): void {
+  writeSSEStream(
+    args.bridge,
+    args.heartbeatTimer,
+    args.blobStore ?? new Map(),
+    args.mcpTools ?? [],
+    args.modelId,
+    args.bridgeKey,
+    args.convKey,
+    args.completedTurns,
+    args.currentTurn,
+    args.req,
+    args.res,
+  );
 }
 
 // ── Tool result resume ──

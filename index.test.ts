@@ -1,5 +1,7 @@
 import rawModels from "./cursor-models-raw.json" with { type: "json" };
 import { afterEach, describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import { request as httpRequest } from "node:http";
 import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
 import {
   resolveModelId,
@@ -16,20 +18,33 @@ import {
   buildCompletedHistoryFingerprint,
   buildCursorRequest,
   parseMessages,
+  setBridgeFactoryForTests,
   shouldDiscardStoredCheckpoint,
+  startProxy,
+  stopProxy,
+  writeSSEStreamForTests,
 } from "./proxy.ts";
 import type { CursorModel, ParsedTurn } from "./proxy.ts";
-import { fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
+  AgentServerMessageSchema,
+  CancelActionSchema,
+  ConversationActionSchema,
   ConversationStateStructureSchema,
   ConversationTurnStructureSchema,
   ConversationStepSchema,
+  ExecServerMessageSchema,
+  InteractionUpdateSchema,
+  McpArgsSchema,
+  TextDeltaUpdateSchema,
   UserMessageSchema,
 } from "./proto/agent_pb.ts";
 
 afterEach(() => {
+  stopProxy();
+  setBridgeFactoryForTests();
   cleanupAllSessionState();
 });
 
@@ -959,4 +974,361 @@ describe("parseMessages — structured tool turns", () => {
   });
 });
 
+function frameConnectMessageForTest(data: Uint8Array, flags = 0): Buffer {
+  const frame = Buffer.alloc(5 + data.length);
+  frame[0] = flags;
+  frame.writeUInt32BE(data.length, 1);
+  frame.set(data, 5);
+  return frame;
+}
+
+function decodeConnectFramesForTest(data: Uint8Array): Uint8Array[] {
+  const frames: Uint8Array[] = [];
+  let pending = Buffer.from(data);
+  while (pending.length >= 5) {
+    const length = pending.readUInt32BE(1);
+    if (pending.length < 5 + length) break;
+    frames.push(pending.subarray(5, 5 + length));
+    pending = pending.subarray(5 + length);
+  }
+  return frames;
+}
+
+class FakeBridge {
+  readonly proc = {
+    kill: () => {
+      this.close(143);
+      return true;
+    },
+  };
+
+  private aliveState = true;
+  private dataCb: ((chunk: Buffer) => void) | null = null;
+  private closeCb: ((code: number) => void) | null = null;
+  private pendingCloseCode: number | null = null;
+  private pendingServerChunks: Buffer[] = [];
+  readonly clientMessages: any[] = [];
+
+  constructor(
+    readonly options: { accessToken: string; rpcPath: string; url?: string; unary?: boolean },
+    private readonly onClientMessage?: (message: any, bridge: FakeBridge) => void,
+  ) {}
+
+  get alive() {
+    return this.aliveState;
+  }
+
+  write(data: Uint8Array) {
+    for (const frame of decodeConnectFramesForTest(data)) {
+      const clientMessage = fromBinary(AgentClientMessageSchema, frame);
+      this.clientMessages.push(clientMessage);
+      this.onClientMessage?.(clientMessage, this);
+    }
+  }
+
+  end() {
+    this.close(0);
+  }
+
+  onData(cb: (chunk: Buffer) => void) {
+    this.dataCb = cb;
+    for (const chunk of this.pendingServerChunks.splice(0)) cb(chunk);
+  }
+
+  onClose(cb: (code: number) => void) {
+    if (this.pendingCloseCode !== null) {
+      const code = this.pendingCloseCode;
+      queueMicrotask(() => cb(code));
+      return;
+    }
+    this.closeCb = cb;
+  }
+
+  emitServerMessage(message: any) {
+    const payload = toBinary(AgentServerMessageSchema, message);
+    this.emitChunk(frameConnectMessageForTest(payload));
+  }
+
+  emitEndStream(payload: Record<string, unknown> = {}) {
+    const bytes = new TextEncoder().encode(JSON.stringify(payload));
+    this.emitChunk(frameConnectMessageForTest(bytes, 0b00000010));
+  }
+
+  close(code = 0) {
+    if (!this.aliveState) return;
+    this.aliveState = false;
+    if (this.closeCb) {
+      const cb = this.closeCb;
+      queueMicrotask(() => cb(code));
+    } else {
+      this.pendingCloseCode = code;
+    }
+  }
+
+  private emitChunk(chunk: Buffer) {
+    if (this.dataCb) {
+      this.dataCb(chunk);
+    } else {
+      this.pendingServerChunks.push(chunk);
+    }
+  }
+}
+
+function makeTextDeltaMessage(text: string) {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text }) },
+      }),
+    },
+  });
+}
+
+function makeCheckpointMessage() {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "conversationCheckpointUpdate",
+      value: create(ConversationStateStructureSchema, {}),
+    },
+  });
+}
+
+function makeMcpExecMessage(toolCallId: string, toolName: string, args: Record<string, string>) {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "execServerMessage",
+      value: create(ExecServerMessageSchema, {
+        id: 1,
+        execId: "exec-1",
+        message: {
+          case: "mcpArgs",
+          value: create(McpArgsSchema, {
+            name: toolName,
+            toolName,
+            toolCallId,
+            providerIdentifier: "pi",
+            args: Object.fromEntries(
+              Object.entries(args).map(([key, value]) => [key, new TextEncoder().encode(value)]),
+            ),
+          }),
+        },
+      }),
+    },
+  });
+}
+
+async function postChatCompletion(port: number, body: Record<string, unknown>) {
+  return new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+    const req = httpRequest({
+      hostname: "127.0.0.1",
+      port,
+      path: "/v1/chat/completions",
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    }, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, body: data }));
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.end(JSON.stringify(body));
+  });
+}
+
+describe("proxy integration — session handling", () => {
+  test("tool-call continuation reuses the live bridge and commits a checkpoint when the turn completes", async () => {
+    const runRequests: any[] = [];
+    const execClientMessages: any[] = [];
+    const bridges: FakeBridge[] = [];
+
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        if (clientMessage.message.case === "runRequest") {
+          runRequests.push(clientMessage.message.value);
+          fake.emitServerMessage(makeMcpExecMessage("tc1", "read", { path: "README.md" }));
+          return;
+        }
+
+        if (clientMessage.message.case === "execClientMessage") {
+          execClientMessages.push(clientMessage.message.value);
+          setTimeout(() => {
+            fake.emitServerMessage(makeTextDeltaMessage("I found the issue."));
+            fake.emitServerMessage(makeCheckpointMessage());
+            fake.close(0);
+          }, 0);
+        }
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+
+    const sessionId = "session-tool";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const port = await startProxy(async () => "test-token");
+
+    const first = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [{ role: "user", content: "inspect file" }],
+      tools: [{ type: "function", function: { name: "read" } }],
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(first.body).toContain("\"finish_reason\":\"tool_calls\"");
+    expect(first.body).toContain("\"id\":\"tc1\"");
+    expect(bridges).toHaveLength(1);
+    expect(runRequests).toHaveLength(1);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+
+    const second = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "user", content: "inspect file" },
+        { role: "assistant", content: null, tool_calls: [{ id: "tc1", type: "function", function: { name: "read", arguments: '{"path":"README.md"}' } }] },
+        { role: "tool", content: "README contents", tool_call_id: "tc1" },
+      ],
+    });
+
+    expect(second.statusCode).toBe(200);
+    expect(second.body).toContain("I found the issue.");
+    expect(runRequests).toHaveLength(1);
+    expect(execClientMessages).toHaveLength(1);
+    expect(execClientMessages[0].execId).toBe("exec-1");
+    expect(execClientMessages[0].message.case).toBe("mcpResult");
+    expect(execClientMessages[0].message.value.result.case).toBe("success");
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+
+    const stored = __testInternals.conversationStates.get(convKey);
+    expect(stored?.checkpoint).toBeTruthy();
+    expect(stored?.checkpointTurnCount).toBe(1);
+    expect(stored?.checkpointHistoryFingerprint).toBe(buildCompletedHistoryFingerprint([
+      turn("inspect file", [
+        toolStep("tc1", "read", { path: "README.md" }, { content: "README contents", isError: false }),
+        assistantStep("I found the issue."),
+      ]),
+    ]));
+  });
+
+  test("stream cancellation sends cancelAction and does not commit a checkpoint", async () => {
+    let cancelCount = 0;
+    const sessionId = "session-cancel";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const currentTurn = turn("interrupt me");
+
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-cancel",
+      checkpoint: null,
+      checkpointTurnCount: 0,
+      checkpointHistoryFingerprint: null,
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" }, (clientMessage, fake) => {
+      if (clientMessage.message.case === "conversationAction") {
+        expect(clientMessage.message.value.action.case).toBe("cancelAction");
+        cancelCount += 1;
+        fake.close(0);
+      }
+    });
+
+    const req = new EventEmitter() as any;
+    const res = new EventEmitter() as any;
+    res.headersSent = false;
+    res.writeHead = () => {
+      res.headersSent = true;
+      return res;
+    };
+    res.write = () => {
+      queueMicrotask(() => res.emit("close"));
+      return true;
+    };
+    res.end = () => {
+      res.headersSent = true;
+      return res;
+    };
+
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+    writeSSEStreamForTests({
+      bridge: bridge as any,
+      heartbeatTimer,
+      modelId: "gpt-5",
+      bridgeKey,
+      convKey,
+      completedTurns: [],
+      currentTurn,
+      req,
+      res,
+    });
+
+    bridge.emitServerMessage(makeTextDeltaMessage("partial output"));
+    bridge.emitServerMessage(makeCheckpointMessage());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const stored = __testInternals.conversationStates.get(convKey);
+    expect(cancelCount).toBe(1);
+    expect(stored).toBeDefined();
+    expect(stored?.checkpoint).toBeNull();
+    expect(stored?.checkpointTurnCount).toBe(0);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+  });
+
+  test("same-depth branch divergence discards a stale stored checkpoint before the upstream run starts", async () => {
+    const runRequests: any[] = [];
+
+    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
+      if (clientMessage.message.case === "runRequest") {
+        runRequests.push(clientMessage.message.value);
+        fake.close(0);
+      }
+    }));
+
+    const sessionId = "session-branch";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const storedTurns = [turn("first", [assistantStep("branch-a")])];
+    const priorPayload = buildCursorRequest("gpt-5", "system", "next", storedTurns, "conv-branch", null);
+    const priorRequest = decodeRunRequest(priorPayload);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-branch",
+      checkpoint: toBinary(ConversationStateStructureSchema, priorRequest.conversationState),
+      checkpointTurnCount: 1,
+      checkpointHistoryFingerprint: buildCompletedHistoryFingerprint(storedTurns),
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "system", content: "system" },
+        { role: "user", content: "first" },
+        { role: "assistant", content: "branch-b" },
+        { role: "user", content: "next" },
+      ],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(runRequests).toHaveLength(1);
+
+    const req = runRequests[0];
+    expect(req.conversationState.turns).toHaveLength(1);
+    const decoded = decodeTurns(req.conversationState);
+    expect(decoded).toHaveLength(1);
+    expect(decoded[0].userMsg.text).toBe("first");
+    expect(decoded[0].steps).toHaveLength(1);
+    expect(decoded[0].steps[0].message.case).toBe("assistantMessage");
+    expect((decoded[0].steps[0].message.value as any).text).toBe("branch-b");
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toBeNull();
+  });
+});
 
