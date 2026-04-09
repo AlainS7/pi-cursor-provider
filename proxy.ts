@@ -705,13 +705,8 @@ async function handleChatCompletion(
   const effectiveUserText = userText || (toolResults.length > 0
     ? toolResults.map((r) => r.content).join("\n")
     : "");
-  // When no checkpoint exists, use a fresh conversationId so Cursor doesn't
-  // choke on stale server-side state from a previous interrupted connection.
-  // The full conversation history is still rebuilt from turns.
   if (!stored.checkpoint) {
-    const previousConversationId = stored.conversationId;
-    stored.conversationId = crypto.randomUUID();
-    debugLog("chat.fresh_conversation_id", { requestId, convKey, previousConversationId, newConversationId: stored.conversationId });
+    debugLog("chat.no_checkpoint", { requestId, convKey, conversationId: stored.conversationId });
   }
   const payload = buildCursorRequest(
     modelId, systemPrompt, effectiveUserText, turns,
@@ -944,6 +939,12 @@ function encodeMcpArgsMap(args: Record<string, unknown>): Record<string, Uint8Ar
   return encoded;
 }
 
+function storeAsBlob(data: Uint8Array, blobStore: Map<string, Uint8Array>): Uint8Array {
+  const id = new Uint8Array(createHash("sha256").update(data).digest());
+  blobStore.set(Buffer.from(id).toString("hex"), data);
+  return id;
+}
+
 function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
   if (step.kind === "assistantText") {
     return toBinary(ConversationStepSchema, create(ConversationStepSchema, {
@@ -1021,10 +1022,8 @@ export function buildCursorRequest(
   });
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
-  const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
-  const systemBytes = new TextEncoder().encode(systemJson);
-  const systemBlobId = new Uint8Array(createHash("sha256").update(systemBytes).digest());
-  blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
+  const systemBytes = new TextEncoder().encode(JSON.stringify({ role: "system", content: systemPrompt }));
+  const systemBlobId = storeAsBlob(systemBytes, blobStore);
 
   let conversationState;
   if (checkpoint) {
@@ -1036,20 +1035,18 @@ export function buildCursorRequest(
         text: turn.userText,
         messageId: crypto.randomUUID(),
       });
-      const userMsgBytes = toBinary(UserMessageSchema, userMsg);
-      const stepBytes = turn.steps.map(buildTurnStepBytes);
+      const userMsgBlobId = storeAsBlob(toBinary(UserMessageSchema, userMsg), blobStore);
+      const stepBlobIds = turn.steps.map(s => storeAsBlob(buildTurnStepBytes(s), blobStore));
 
       const agentTurn = create(AgentConversationTurnStructureSchema, {
-        userMessage: userMsgBytes,
-        steps: stepBytes,
+        userMessage: userMsgBlobId,
+        steps: stepBlobIds,
+        requestId: crypto.randomUUID(),
       });
       const turnStructure = create(ConversationTurnStructureSchema, {
         turn: { case: "agentConversationTurn", value: agentTurn },
       });
-      const turnData = toBinary(ConversationTurnStructureSchema, turnStructure);
-      const turnBlobId = new Uint8Array(createHash("sha256").update(turnData).digest());
-      blobStore.set(Buffer.from(turnBlobId).toString("hex"), turnData);
-      turnBlobIds.push(turnBlobId);
+      turnBlobIds.push(storeAsBlob(toBinary(ConversationTurnStructureSchema, turnStructure), blobStore));
     }
 
     conversationState = create(ConversationStateStructureSchema, {

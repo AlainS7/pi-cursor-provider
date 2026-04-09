@@ -673,19 +673,22 @@ function decodeRunRequest(payload: ReturnType<typeof buildCursorRequest>) {
   return clientMsg.message.value as InstanceType<typeof AgentRunRequestSchema["$typeName"]> & any;
 }
 
+function resolveBlob(data: Uint8Array, blobStore?: Map<string, Uint8Array>): Uint8Array {
+  if (blobStore && data.length === 32) {
+    const resolved = blobStore.get(Buffer.from(data).toString("hex"));
+    if (resolved) return resolved;
+  }
+  return data;
+}
+
 function decodeTurns(state: any, blobStore?: Map<string, Uint8Array>) {
-  return (state.turns as Uint8Array[]).map((turnBlobIdOrData: Uint8Array) => {
-    // Turns may be blob references (SHA-256 hashes) or inline data
-    let turnBytes = turnBlobIdOrData;
-    if (blobStore && turnBlobIdOrData.length === 32) {
-      const resolved = blobStore.get(Buffer.from(turnBlobIdOrData).toString("hex"));
-      if (resolved) turnBytes = resolved;
-    }
+  return (state.turns as Uint8Array[]).map((turnRef: Uint8Array) => {
+    const turnBytes = resolveBlob(turnRef, blobStore);
     const turnStruct = fromBinary(ConversationTurnStructureSchema, turnBytes);
     expect(turnStruct.turn.case).toBe("agentConversationTurn");
     const agentTurn = turnStruct.turn.value as any;
-    const userMsg = fromBinary(UserMessageSchema, agentTurn.userMessage);
-    const steps = (agentTurn.steps as Uint8Array[]).map((s: Uint8Array) => fromBinary(ConversationStepSchema, s));
+    const userMsg = fromBinary(UserMessageSchema, resolveBlob(agentTurn.userMessage, blobStore));
+    const steps = (agentTurn.steps as Uint8Array[]).map((s: Uint8Array) => fromBinary(ConversationStepSchema, resolveBlob(s, blobStore)));
     return { userMsg, steps };
   });
 }
