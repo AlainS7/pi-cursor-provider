@@ -72,6 +72,7 @@ import {
   type ExecServerMessage,
   type KvServerMessage,
   type McpToolDefinition,
+  type UserMessage,
 } from "./proto/agent_pb.js";
 
 const CURSOR_API_URL = "https://api2.cursor.sh";
@@ -940,18 +941,15 @@ function encodeMcpArgsMap(args: Record<string, unknown>): Record<string, Uint8Ar
   return encoded;
 }
 
-/** Build the selectedContextBlob payload — references rootPromptMessagesJson blobs + client name. */
+// No generated schema for selectedContextBlob; emit raw wire format for the two
+// fields Cursor actually reads: field 1 (repeated bytes) rootPromptMessagesJson
+// refs, field 22 (string) clientName. blobId.length < 128 (SHA256 = 32 bytes).
 function buildSelectedContextBlob(rootPromptBlobIds: Uint8Array[], clientName: string): Uint8Array {
-  // No known schema for this message; encode raw protobuf wire format.
-  // field 1 (repeated bytes) = rootPromptMessagesJson blob refs
-  // field 22 (string) = client name
   const parts: Uint8Array[] = [];
   for (const blobId of rootPromptBlobIds) {
-    // tag = (1 << 3) | 2 = 0x0A, then varint length, then data
     parts.push(new Uint8Array([0x0A, blobId.length, ...blobId]));
   }
   const clientBytes = new TextEncoder().encode(clientName);
-  // tag for field 22 = (22 << 3) | 2 = 178 = 0xB2, varint continuation: 0xB2 0x01
   parts.push(new Uint8Array([0xB2, 0x01, clientBytes.length, ...clientBytes]));
   const total = parts.reduce((n, p) => n + p.length, 0);
   const result = new Uint8Array(total);
@@ -964,6 +962,18 @@ function storeAsBlob(data: Uint8Array, blobStore: Map<string, Uint8Array>): Uint
   const id = new Uint8Array(createHash("sha256").update(data).digest());
   blobStore.set(Buffer.from(id).toString("hex"), data);
   return id;
+}
+
+function createUserMessage(text: string, selectedContextBlob: Uint8Array): UserMessage {
+  const messageId = crypto.randomUUID();
+  return create(UserMessageSchema, {
+    text,
+    messageId,
+    selectedContext: create(SelectedContextSchema, {}),
+    mode: 1,
+    selectedContextBlob,
+    correlationId: messageId,
+  });
 }
 
 function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
@@ -1045,25 +1055,17 @@ export function buildCursorRequest(
 
   const systemBytes = new TextEncoder().encode(JSON.stringify({ role: "system", content: systemPrompt }));
   const systemBlobId = storeAsBlob(systemBytes, blobStore);
+  const selectedCtxBlob = storeAsBlob(
+    buildSelectedContextBlob([systemBlobId], "pi"), blobStore,
+  );
 
   let conversationState;
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
-    const selectedCtxBlob = storeAsBlob(
-      buildSelectedContextBlob([systemBlobId], "pi"), blobStore,
-    );
     const turnBlobIds: Uint8Array[] = [];
     for (const turn of turns) {
-      const msgId = crypto.randomUUID();
-      const userMsg = create(UserMessageSchema, {
-        text: turn.userText,
-        messageId: msgId,
-        selectedContext: create(SelectedContextSchema, {}),
-        mode: 1,
-        selectedContextBlob: selectedCtxBlob,
-        correlationId: msgId,
-      });
+      const userMsg = createUserMessage(turn.userText, selectedCtxBlob);
       const userMsgBlobId = storeAsBlob(toBinary(UserMessageSchema, userMsg), blobStore);
       const stepBlobIds = turn.steps.map(s => storeAsBlob(buildTurnStepBytes(s), blobStore));
 
@@ -1096,18 +1098,7 @@ export function buildCursorRequest(
     });
   }
 
-  const actionSelectedCtxBlob = storeAsBlob(
-    buildSelectedContextBlob([systemBlobId], "pi"), blobStore,
-  );
-  const actionMsgId = crypto.randomUUID();
-  const userMessage = create(UserMessageSchema, {
-    text: userText,
-    messageId: actionMsgId,
-    selectedContext: create(SelectedContextSchema, {}),
-    mode: 1,
-    selectedContextBlob: actionSelectedCtxBlob,
-    correlationId: actionMsgId,
-  });
+  const userMessage = createUserMessage(userText, selectedCtxBlob);
   const action = create(ConversationActionSchema, {
     action: { case: "userMessageAction", value: create(UserMessageActionSchema, { userMessage }) },
   });
