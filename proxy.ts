@@ -9,7 +9,7 @@ import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,7 +67,12 @@ import {
   WriteShellStdinResultSchema,
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
+  CursorRuleSchema,
+  CursorRuleTypeSchema,
+  CursorRuleTypeGlobalSchema,
+  CursorRuleTypeAgentFetchedSchema,
   type AgentServerMessage,
+  type CursorRule,
   type ConversationStateStructure,
   type ExecServerMessage,
   type KvServerMessage,
@@ -91,6 +96,9 @@ interface OpenAIToolCall {
 interface ContentPart {
   type: string;
   text?: string;
+  image_url?: { url?: string; detail?: string };
+  input_image?: string;
+  url?: string;
 }
 
 interface OpenAIMessage {
@@ -126,6 +134,7 @@ interface CursorRequestPayload {
   requestBytes: Uint8Array;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
+  requestContextRules: CursorRule[];
 }
 
 interface PendingExec {
@@ -152,6 +161,7 @@ interface ActiveBridge {
   heartbeatTimer: ReturnType<typeof setInterval>;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
+  requestContextRules: CursorRule[];
   pendingExecs: PendingExec[];
   currentTurn: ParsedTurn;
 }
@@ -162,6 +172,16 @@ export interface StoredConversation {
   sessionScoped: boolean;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
+}
+
+interface ContextFileEntry {
+  path: string;
+  content: string;
+}
+
+interface PreparedPromptContext {
+  cleanedPrompt: string;
+  rules: CursorRule[];
 }
 
 interface StreamState {
@@ -210,8 +230,22 @@ interface ParsedMessages {
 
 // ── State ──
 
-const activeBridges = new Map<string, ActiveBridge>();
-const conversationStates = new Map<string, StoredConversation>();
+interface ProxyGlobalState {
+  activeBridges: Map<string, ActiveBridge>;
+  conversationStates: Map<string, StoredConversation>;
+  proxyServer?: ReturnType<typeof createServer>;
+  proxyPort?: number;
+  proxyAccessTokenProvider?: () => Promise<string>;
+}
+
+const proxyGlobalStateKey = Symbol.for("pi-cursor-provider.proxy-state");
+const proxyState = ((globalThis as any)[proxyGlobalStateKey] ??= {
+  activeBridges: new Map<string, ActiveBridge>(),
+  conversationStates: new Map<string, StoredConversation>(),
+}) as ProxyGlobalState;
+
+const activeBridges = proxyState.activeBridges;
+const conversationStates = proxyState.conversationStates;
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 let bridgeFactory: BridgeFactory = spawnBridge;
 let debugRequestCounter = 0;
@@ -297,9 +331,8 @@ export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
   bridgeFactory = factory ?? spawnBridge;
 }
 
-let proxyServer: ReturnType<typeof createServer> | undefined;
-let proxyPort: number | undefined;
-let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
+let cachedContextFiles: ContextFileEntry[] | undefined;
+let cachedContextFilesKey: string | undefined;
 
 // ── Bridge spawn ──
 
@@ -511,14 +544,14 @@ function normalizeCursorModels(models: readonly unknown[]): CursorModel[] {
 // ── Proxy server ──
 
 export function getProxyPort(): number | undefined {
-  return proxyPort;
+  return proxyState.proxyPort;
 }
 
 export async function startProxy(
   getAccessToken: () => Promise<string>,
 ): Promise<number> {
-  proxyAccessTokenProvider = getAccessToken;
-  if (proxyServer && proxyPort) return proxyPort;
+  proxyState.proxyAccessTokenProvider = getAccessToken;
+  if (proxyState.proxyServer && proxyState.proxyPort) return proxyState.proxyPort;
 
   return new Promise((resolve, reject) => {
     const server = createServer(async (req, res) => {
@@ -537,8 +570,8 @@ export async function startProxy(
           const body = await readBody(req);
           const parsed = JSON.parse(body) as ChatCompletionRequest;
           debugLog("http.chat.body", { requestId, body: parsed });
-          if (!proxyAccessTokenProvider) throw new Error("No access token provider");
-          const accessToken = await proxyAccessTokenProvider();
+          if (!proxyState.proxyAccessTokenProvider) throw new Error("No access token provider");
+          const accessToken = await proxyState.proxyAccessTokenProvider();
           await handleChatCompletion(parsed, accessToken, req, res, requestId);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -556,10 +589,13 @@ export async function startProxy(
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       if (typeof addr === "object" && addr) {
-        proxyPort = addr.port;
-        proxyServer = server;
-        debugLog("proxy.start", { port: proxyPort, debugLogFile: isProxyDebugEnabled() ? getDebugLogFilePath() : undefined });
-        resolve(proxyPort);
+        // Do not keep the event loop alive for one-shot pi invocations
+        // (e.g. --mode json / -p).
+        server.unref();
+        proxyState.proxyPort = addr.port;
+        proxyState.proxyServer = server;
+        debugLog("proxy.start", { port: proxyState.proxyPort, debugLogFile: isProxyDebugEnabled() ? getDebugLogFilePath() : undefined });
+        resolve(proxyState.proxyPort);
       } else {
         reject(new Error("Failed to bind proxy"));
       }
@@ -576,14 +612,16 @@ export function cleanupAllSessionState(): void {
 }
 
 export function stopProxy(): void {
-  debugLog("proxy.stop", { port: proxyPort });
-  if (proxyServer) {
-    proxyServer.close();
-    proxyServer = undefined;
-    proxyPort = undefined;
-    proxyAccessTokenProvider = undefined;
+  debugLog("proxy.stop", { port: proxyState.proxyPort });
+  if (proxyState.proxyServer) {
+    proxyState.proxyServer.close();
+    proxyState.proxyServer = undefined;
+    proxyState.proxyPort = undefined;
+    proxyState.proxyAccessTokenProvider = undefined;
   }
   cleanupAllSessionState();
+  cachedContextFiles = undefined;
+  cachedContextFilesKey = undefined;
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -614,6 +652,7 @@ export function evictStaleConversations(now = Date.now()): void {
  */
 export function resolveModelId(model: string, reasoningEffort?: string): string {
   if (!reasoningEffort) return model;
+  if (reasoningEffort === "med") reasoningEffort = "medium";
 
   let suffix = "";
   let base = model;
@@ -625,7 +664,178 @@ export function resolveModelId(model: string, reasoningEffort?: string): string 
     base = base.slice(0, -9);
   }
 
+  const lastDash = base.lastIndexOf("-");
+  if (lastDash >= 0) {
+    const maybeEffort = base.slice(lastDash + 1);
+    const isCodexMaxBase = /-codex-max$/i.test(base);
+    if (EFFORT_LEVELS.has(maybeEffort) && !isCodexMaxBase) return `${base}${suffix}`;
+  }
+
   return `${base}-${reasoningEffort}${suffix}`;
+}
+
+const EFFORT_LEVELS = new Set(["none", "low", "med", "medium", "high", "xhigh", "max"]);
+
+function contentPartImageUrl(part: ContentPart): string | undefined {
+  return part.image_url?.url ?? part.input_image ?? part.url;
+}
+
+function summarizeImagePart(url: string, detail?: string): string {
+  if (url.startsWith("data:")) {
+    const comma = url.indexOf(",");
+    const prefix = comma >= 0 ? url.slice(0, comma) : url;
+    return `[image data attached: ${prefix}${detail ? `; detail=${detail}` : ""}]`;
+  }
+  return detail ? `[image: ${url}; detail=${detail}]` : `[image: ${url}]`;
+}
+
+function unescapeXml(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+function buildGlobalContextRule(path: string, content: string): CursorRule {
+  return create(CursorRuleSchema, {
+    fullPath: path,
+    content,
+    type: create(CursorRuleTypeSchema, {
+      type: {
+        case: "global",
+        value: create(CursorRuleTypeGlobalSchema, {}),
+      },
+    }),
+  });
+}
+
+function buildSkillContextRule(name: string, description: string, location: string): CursorRule {
+  const syntheticPath = `skill://${name}`;
+  const content = `Skill: ${name}\nLocation: ${location}\n\n${description}`;
+  return create(CursorRuleSchema, {
+    fullPath: syntheticPath,
+    content,
+    type: create(CursorRuleTypeSchema, {
+      type: {
+        case: "agentFetched",
+        value: create(CursorRuleTypeAgentFetchedSchema, { description }),
+      },
+    }),
+  });
+}
+
+function removeRanges(input: string, ranges: Array<{ start: number; end: number }>): string {
+  if (ranges.length === 0) return input;
+  let result = input;
+  const normalized = ranges
+    .filter((range) => range.start >= 0 && range.end > range.start && range.end <= input.length)
+    .sort((a, b) => b.start - a.start);
+  for (const range of normalized) {
+    result = `${result.slice(0, range.start)}${result.slice(range.end)}`;
+  }
+  return result.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+export function preparePromptContextForTests(systemPrompt: string): PreparedPromptContext {
+  return preparePromptContext(systemPrompt);
+}
+
+function preparePromptContext(systemPrompt: string): PreparedPromptContext {
+  if (!systemPrompt) return { cleanedPrompt: "", rules: [] };
+
+  const rules: CursorRule[] = [];
+  const rangesToStrip: Array<{ start: number; end: number }> = [];
+
+  const projectContextHeader = "# Project Context";
+  const projectStart = systemPrompt.indexOf(projectContextHeader);
+  if (projectStart >= 0) {
+    const skillsStart = systemPrompt.indexOf("<available_skills>", projectStart);
+    const currentDateStart = systemPrompt.indexOf("\nCurrent date:", projectStart);
+    let projectEnd = systemPrompt.length;
+    if (skillsStart >= 0) projectEnd = Math.min(projectEnd, skillsStart);
+    if (currentDateStart >= 0) projectEnd = Math.min(projectEnd, currentDateStart);
+    const projectSection = systemPrompt.slice(projectStart, projectEnd);
+    const contextRe = /^##\s+([^\n]+)\n([\s\S]*?)(?=^##\s+[^\n]+\n|$)/gm;
+    let match: RegExpExecArray | null;
+    while ((match = contextRe.exec(projectSection)) !== null) {
+      const rawPath = (match[1] ?? "").trim();
+      const content = (match[2] ?? "").trim();
+      if (!rawPath || !content) continue;
+      rules.push(buildGlobalContextRule(rawPath, content));
+    }
+    if (rules.length > 0) {
+      rangesToStrip.push({ start: projectStart, end: projectEnd });
+    }
+  }
+
+  const skillsOpen = "<available_skills>";
+  const skillsClose = "</available_skills>";
+  const skillsStart = systemPrompt.indexOf(skillsOpen);
+  if (skillsStart >= 0) {
+    const skillsEndTag = systemPrompt.indexOf(skillsClose, skillsStart + skillsOpen.length);
+    if (skillsEndTag > skillsStart) {
+      const skillsEnd = skillsEndTag + skillsClose.length;
+      const skillsSection = systemPrompt.slice(skillsStart, skillsEnd);
+      const skillRe =
+        /<skill>\s*<name>([\s\S]*?)<\/name>\s*<description>([\s\S]*?)<\/description>\s*<location>([\s\S]*?)<\/location>\s*<\/skill>/g;
+      let match: RegExpExecArray | null;
+      while ((match = skillRe.exec(skillsSection)) !== null) {
+        const name = unescapeXml((match[1] ?? "").trim());
+        const description = unescapeXml((match[2] ?? "").trim());
+        const location = unescapeXml((match[3] ?? "").trim());
+        if (!name || !description) continue;
+        rules.push(buildSkillContextRule(name, description, location || "unknown"));
+      }
+      if (rules.length > 0) {
+        rangesToStrip.push({ start: skillsStart, end: skillsEnd });
+      }
+    }
+  }
+
+  if (rules.length === 0) return { cleanedPrompt: systemPrompt, rules: [] };
+
+  const deduped = new Map<string, CursorRule>();
+  for (const rule of rules) {
+    const key = `${rule.fullPath}\u0000${rule.content}`;
+    if (!deduped.has(key)) deduped.set(key, rule);
+  }
+
+  const cleanedPrompt = removeRanges(systemPrompt, rangesToStrip);
+  return {
+    cleanedPrompt: cleanedPrompt || systemPrompt,
+    rules: [...deduped.values()],
+  };
+}
+
+function reinforceAlwaysOnStyleInstructions(systemPrompt: string, rules: CursorRule[]): string {
+  const cavemanSections = rules
+    .map((rule) => extractMarkdownSection(rule.content, "Caveman"))
+    .filter((section): section is string => !!section);
+
+  if (cavemanSections.length === 0) return systemPrompt;
+
+  const styleBlock = [
+    "# Persistent Communication Style",
+    cavemanSections[0],
+  ].join("\n\n");
+
+  if (systemPrompt.includes(styleBlock) || systemPrompt.includes("## Caveman")) {
+    return systemPrompt;
+  }
+
+  return `${styleBlock}\n\n${systemPrompt}`;
+}
+
+function extractMarkdownSection(markdown: string, heading: string): string | null {
+  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(^|\\n)##\\s+${escapedHeading}\\s*\\n([\\s\\S]*?)(?=\\n##\\s+|$)`, "i");
+  const match = re.exec(markdown);
+  if (!match) return null;
+
+  const body = (match[2] ?? "").trim();
+  return body ? `## ${heading}\n\n${body}` : null;
 }
 
 async function handleChatCompletion(
@@ -636,12 +846,22 @@ async function handleChatCompletion(
   requestId: string,
 ): Promise<void> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  const promptContext = preparePromptContext(systemPrompt);
+  const requestContextRules = mergeContextFilesIntoRequestContextRules(promptContext.rules);
+  const reinforcedSystemPrompt = reinforceAlwaysOnStyleInstructions(
+    promptContext.cleanedPrompt,
+    requestContextRules,
+  );
   const modelId = resolveModelId(body.model, body.reasoning_effort);
   const tools = body.tools ?? [];
 
   debugLog("chat.parsed_messages", {
     requestId,
     systemPrompt,
+    cleanedSystemPrompt: promptContext.cleanedPrompt,
+    reinforcedSystemPrompt,
+    promptContextRuleCount: promptContext.rules.length,
+    requestContextRuleCount: requestContextRules.length,
     userText,
     turns,
     toolResults,
@@ -711,7 +931,7 @@ async function handleChatCompletion(
     debugLog("chat.no_checkpoint", { requestId, convKey, conversationId: stored.conversationId });
   }
   const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText, turns,
+    modelId, reinforcedSystemPrompt, effectiveUserText, turns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
   debugLog("chat.cursor_request", {
@@ -723,6 +943,7 @@ async function handleChatCompletion(
     payload,
   });
   payload.mcpTools = mcpTools;
+  payload.requestContextRules = requestContextRules;
 
   const currentTurn: ParsedTurn = {
     userText: effectiveUserText,
@@ -743,7 +964,15 @@ async function handleChatCompletion(
 function textContent(content: OpenAIMessage["content"]): string {
   if (content == null) return "";
   if (typeof content === "string") return content;
-  return content.filter((p) => p.type === "text" && p.text).map((p) => p.text!).join("\n");
+  return content
+    .map((part) => {
+      if (part.type === "text" && part.text) return part.text;
+      const imageUrl = contentPartImageUrl(part);
+      if (imageUrl) return summarizeImagePart(imageUrl, part.image_url?.detail);
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
 }
 
 function parseToolCallArguments(raw: string): Record<string, unknown> {
@@ -1108,7 +1337,12 @@ export function buildCursorRequest(
     message: { case: "runRequest", value: runRequest },
   });
 
-  const payload = { requestBytes: toBinary(AgentClientMessageSchema, clientMessage), blobStore, mcpTools: [] };
+  const payload = {
+    requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
+    blobStore,
+    mcpTools: [],
+    requestContextRules: [],
+  };
   debugLog("cursor_request.build.end", payload);
   return payload;
 }
@@ -1119,6 +1353,7 @@ function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  requestContextRules: CursorRule[],
   sendFrame: (data: Uint8Array) => void,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
@@ -1143,7 +1378,7 @@ function processServerMessage(
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
-    handleExecMessage(msg.message.value as ExecServerMessage, mcpTools, sendFrame, onMcpExec);
+    handleExecMessage(msg.message.value as ExecServerMessage, mcpTools, requestContextRules, sendFrame, onMcpExec);
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if ((stateStructure as any).tokenDetails) {
@@ -1192,6 +1427,7 @@ function handleKvMessage(
 function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
+  requestContextRules: CursorRule[],
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
 ): void {
@@ -1199,9 +1435,24 @@ function handleExecMessage(
   const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "requestContextArgs") {
+    const contextFiles = loadDefaultContextFiles();
+    const rulePaths = new Set(requestContextRules.map((r) => r.fullPath));
+    const ruleContents = new Set(requestContextRules.map((r) => r.content.trim()));
+    const fileContents = Object.fromEntries(
+      contextFiles
+        .filter((entry) => {
+          if (rulePaths.has(entry.path)) return false;
+          if (ruleContents.has(entry.content.trim())) return false;
+          return true;
+        })
+        .map((entry) => [entry.path, entry.content]),
+    );
     const requestContext = create(RequestContextSchema, {
-      rules: [], repositoryInfo: [], tools: mcpTools, gitRepos: [],
-      projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [],
+      rules: requestContextRules, repositoryInfo: [], tools: mcpTools, gitRepos: [],
+      projectLayouts: [],
+      mcpInstructions: [],
+      fileContents,
+      customSubagents: [],
     });
     const result = create(RequestContextResultSchema, {
       result: { case: "success", value: create(RequestContextSuccessSchema, { requestContext }) },
@@ -1326,6 +1577,96 @@ function handleExecMessage(
   if (guessedResult && guessedResult !== execCase) {
     sendExecResult(execMsg, guessedResult, create(McpResultSchema, {}), sendFrame);
   }
+}
+
+function loadDefaultContextFiles(): ContextFileEntry[] {
+  const cacheKey = `${process.cwd()}|${process.env.HOME ?? ""}`;
+  if (cachedContextFiles && cachedContextFilesKey === cacheKey) return cachedContextFiles;
+
+  const home = process.env.HOME ?? "";
+  const candidates = new Set([
+    pathResolve(process.cwd(), "AGENTS.md"),
+    pathResolve(process.cwd(), ".cursor", "AGENTS.md"),
+    pathResolve(process.cwd(), ".pi", "AGENTS.md"),
+    pathResolve(process.cwd(), ".pi", "skills", "SKILLS.md"),
+    pathResolve(process.cwd(), ".pi", "agent", "skills", "SKILLS.md"),
+    ...(home ? [
+      pathResolve(home, ".pi", "AGENTS.md"),
+      pathResolve(home, ".pi", "agent", "AGENTS.md"),
+      pathResolve(home, ".pi", "agent", "skills", "SKILLS.md"),
+    ] : []),
+  ]);
+
+  const addExtensionContextCandidates = (extensionsRoot: string) => {
+    if (!existsSync(extensionsRoot)) return;
+    let entries: ReturnType<typeof readdirSync>;
+    try {
+      entries = readdirSync(extensionsRoot, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      candidates.add(pathResolve(extensionsRoot, entry.name, "AGENTS.md"));
+      candidates.add(pathResolve(extensionsRoot, entry.name, "skills", "SKILLS.md"));
+    }
+  };
+
+  addExtensionContextCandidates(pathResolve(process.cwd(), ".pi", "extensions"));
+  addExtensionContextCandidates(pathResolve(process.cwd(), ".pi", "agent", "extensions"));
+  if (home) addExtensionContextCandidates(pathResolve(home, ".pi", "agent", "extensions"));
+
+  const files: ContextFileEntry[] = [];
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const stat = statSync(candidate);
+      if (!stat.isFile() || stat.size > 256 * 1024) continue;
+      const content = readFileSync(candidate, "utf8").trim();
+      if (!content) continue;
+      files.push({ path: candidate, content });
+    } catch {
+      // Ignore unreadable optional context files.
+    }
+  }
+
+  cachedContextFiles = files;
+  cachedContextFilesKey = cacheKey;
+  return files;
+}
+
+/**
+ * Cursor appears to weight `requestContext.rules` (especially `global`) more reliably than
+ * `fileContents` alone. Merge AGENTS.md / SKILLS.md discovered on disk into rules so Pi
+ * instructions stay attached to the same requestContext fetch as other rules.
+ */
+export function mergeContextFilesIntoRequestContextRules(promptRules: CursorRule[]): CursorRule[] {
+  const contextFiles = loadDefaultContextFiles();
+  if (contextFiles.length === 0) return promptRules;
+
+  const existingTrimmedContent = new Set(promptRules.map((r) => r.content.trim()));
+  const deduped = new Map<string, CursorRule>();
+  const key = (r: CursorRule) => `${r.fullPath}\u0000${r.content}`;
+  for (const rule of promptRules) deduped.set(key(rule), rule);
+
+  for (const entry of contextFiles) {
+    const trimmed = entry.content.trim();
+    if (existingTrimmedContent.has(trimmed)) continue;
+    const rule = buildGlobalContextRule(entry.path, entry.content);
+    const k = key(rule);
+    if (!deduped.has(k)) deduped.set(k, rule);
+  }
+
+  return [...deduped.values()];
+}
+
+export function resetContextFileCacheForTests(): void {
+  cachedContextFiles = undefined;
+  cachedContextFilesKey = undefined;
+}
+
+export function loadDefaultContextFilesForTests(): Array<{ path: string; content: string }> {
+  return loadDefaultContextFiles();
 }
 
 function sendExecResult(
@@ -1571,6 +1912,7 @@ function handleStreamingResponse(
     heartbeatTimer,
     payload.blobStore,
     payload.mcpTools,
+    payload.requestContextRules,
     modelId,
     bridgeKey,
     convKey,
@@ -1614,6 +1956,7 @@ function writeSSEStream(
   heartbeatTimer: ReturnType<typeof setInterval>,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
+  requestContextRules: CursorRule[],
   modelId: string,
   bridgeKey: string,
   convKey: string,
@@ -1684,7 +2027,7 @@ function writeSSEStream(
       try {
         const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
         processServerMessage(
-          serverMessage, blobStore, mcpTools,
+          serverMessage, blobStore, mcpTools, requestContextRules,
           (data) => bridge.write(data),
           state,
           (text, isThinking) => {
@@ -1726,7 +2069,7 @@ function writeSSEStream(
             }));
 
             activeBridges.set(bridgeKey, {
-              bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
+              bridge, heartbeatTimer, blobStore, mcpTools, requestContextRules, pendingExecs: state.pendingExecs, currentTurn,
             });
             debugLog("stream.tool_call_pause", { requestId, bridgeKey, exec, pendingExecs: state.pendingExecs, currentTurn });
 
@@ -1806,6 +2149,7 @@ export function writeSSEStreamForTests(args: {
   heartbeatTimer: ReturnType<typeof setInterval>;
   blobStore?: Map<string, Uint8Array>;
   mcpTools?: McpToolDefinition[];
+  requestContextRules?: CursorRule[];
   modelId: string;
   bridgeKey: string;
   convKey: string;
@@ -1820,6 +2164,7 @@ export function writeSSEStreamForTests(args: {
     args.heartbeatTimer,
     args.blobStore ?? new Map(),
     args.mcpTools ?? [],
+    args.requestContextRules ?? [],
     args.modelId,
     args.bridgeKey,
     args.convKey,
@@ -1845,7 +2190,7 @@ function handleToolResultResume(
   stream: boolean,
   requestId?: string,
 ): void {
-  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, currentTurn } = active;
+  const { bridge, heartbeatTimer, blobStore, mcpTools, requestContextRules, pendingExecs, currentTurn } = active;
   debugLog("tool_resume.start", { requestId, bridgeKey, convKey, toolResults, pendingExecs, currentTurn });
 
   for (const result of toolResults) {
@@ -1863,6 +2208,7 @@ function handleToolResultResume(
       heartbeatTimer,
       blobStore,
       mcpTools,
+      requestContextRules,
       pendingExecs,
       currentTurn,
     });
@@ -1908,6 +2254,7 @@ function handleToolResultResume(
     heartbeatTimer,
     blobStore,
     mcpTools,
+    requestContextRules,
     modelId,
     bridgeKey,
     convKey,
@@ -1962,10 +2309,10 @@ async function handleNonStreamingResponse(
       (messageBytes) => {
         try {
           const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
-          processServerMessage(
-            serverMessage, payload.blobStore, payload.mcpTools,
-            (data) => bridge.write(data),
-            state,
+        processServerMessage(
+          serverMessage, payload.blobStore, payload.mcpTools, payload.requestContextRules,
+          (data) => bridge.write(data),
+          state,
             (text, isThinking) => {
               if (isThinking) return;
               const { content } = tagFilter.process(text);
