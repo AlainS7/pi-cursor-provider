@@ -810,20 +810,23 @@ function preparePromptContext(systemPrompt: string): PreparedPromptContext {
 }
 
 function reinforceAlwaysOnStyleInstructions(systemPrompt: string, rules: CursorRule[]): string {
-  const cavemanSections = rules
-    .map((rule) => extractMarkdownSection(rule.content, "Caveman"))
+  const persistentHeadings = ["Caveman", "CTX7", "Child Sessions"] as const;
+  const extractedSections = persistentHeadings
+    .map((heading) => {
+      for (const rule of rules) {
+        const section = extractMarkdownSection(rule.content, heading);
+        if (section) return section;
+      }
+      return null;
+    })
     .filter((section): section is string => !!section);
 
-  if (cavemanSections.length === 0) return systemPrompt;
+  if (extractedSections.length === 0) return systemPrompt;
 
-  const styleBlock = [
-    "# Persistent Communication Style",
-    cavemanSections[0],
-  ].join("\n\n");
+  const styleBlock = ["# Persistent rules", ...extractedSections].join("\n\n");
 
-  if (systemPrompt.includes(styleBlock) || systemPrompt.includes("## Caveman")) {
-    return systemPrompt;
-  }
+  const alreadyEmbedded = extractedSections.every((section) => systemPrompt.includes(section));
+  if (alreadyEmbedded) return systemPrompt;
 
   return `${styleBlock}\n\n${systemPrompt}`;
 }
