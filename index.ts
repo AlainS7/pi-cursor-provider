@@ -170,6 +170,8 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gpt-5.3-codex":           { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
   "gpt-5.4":                 { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
   "gpt-5.4-mini":            { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
+  "gpt-5.5":                 { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+  "gpt-5.5-mini":            { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
   "grok-4.20":               { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 0 },
   "kimi-k2.5":               { input: 0.6, output: 3, cacheRead: 0.1, cacheWrite: 0 },
 };
@@ -180,6 +182,8 @@ const MODEL_COST_PATTERNS: Array<{ match: (id: string) => boolean; cost: ModelCo
   { match: (id) => /claude.*haiku/i.test(id),        cost: MODEL_COST_TABLE["claude-4.5-haiku"]! },
   { match: (id) => /claude.*sonnet/i.test(id),       cost: MODEL_COST_TABLE["claude-4.6-sonnet"]! },
   { match: (id) => /composer/i.test(id),             cost: MODEL_COST_TABLE["composer-1"]! },
+  { match: (id) => /gpt-5\.5.*mini/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.5-mini"]! },
+  { match: (id) => /gpt-5\.5/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.5"]! },
   { match: (id) => /gpt-5\.4.*mini/i.test(id),      cost: MODEL_COST_TABLE["gpt-5.4-mini"]! },
   { match: (id) => /gpt-5\.4/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.4"]! },
   { match: (id) => /gpt-5\.3/i.test(id),            cost: MODEL_COST_TABLE["gpt-5.3-codex"]! },
@@ -199,7 +203,7 @@ function estimateModelCost(modelId: string): ModelCost {
   const normalized = modelId.toLowerCase();
   const exact = MODEL_COST_TABLE[normalized];
   if (exact) return exact;
-  const stripped = normalized.replace(/-(high|medium|low|preview|thinking|spark-preview|fast)$/g, "");
+  const stripped = normalized.replace(/-(xhigh|medium|high|none|max|low|med|preview|thinking|spark-preview|fast)$/g, "");
   const strippedMatch = MODEL_COST_TABLE[stripped];
   if (strippedMatch) return strippedMatch;
   return MODEL_COST_PATTERNS.find((p) => p.match(normalized))?.cost ?? DEFAULT_COST;
@@ -208,7 +212,7 @@ function estimateModelCost(modelId: string): ModelCost {
 
 // ── Effort-level dedup ──
 
-const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max", "none"]);
+const EFFORT_LEVELS = new Set(["low", "med", "medium", "high", "xhigh", "max", "none"]);
 
 interface ParsedModelId {
   base: string;       // model ID with effort stripped
@@ -235,7 +239,8 @@ export function parseModelId(id: string): ParsedModelId {
   if (lastDash >= 0) {
     const suffix = remaining.slice(lastDash + 1);
     if (EFFORT_LEVELS.has(suffix)) {
-      return { base: remaining.slice(0, lastDash), effort: suffix, fast, thinking };
+      const effort = suffix === "med" ? "medium" : suffix;
+      return { base: remaining.slice(0, lastDash), effort, fast, thinking };
     }
   }
 
@@ -334,12 +339,44 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
   return result.sort((a, b) => a.id.localeCompare(b.id));
 }
 
+function injectEffortSuffix(modelId: string, effortSuffix: string): string {
+  if (!effortSuffix) return modelId;
+  if (modelId.endsWith("-fast")) return `${modelId.slice(0, -5)}-${effortSuffix}-fast`;
+  if (modelId.endsWith("-thinking")) return `${modelId.slice(0, -9)}-${effortSuffix}-thinking`;
+  return `${modelId}-${effortSuffix}`;
+}
+
+export function expandModelsForSelection(models: ProcessedModel[]): ProcessedModel[] {
+  const expanded = new Map<string, ProcessedModel>();
+
+  for (const model of models) {
+    expanded.set(model.id, model);
+    if (!model.supportsEffort || !model.effortMap) continue;
+
+    const effortVariants = new Set(Object.values(model.effortMap).filter((effort) => effort));
+    for (const effort of effortVariants) {
+      const aliasId = injectEffortSuffix(model.id, effort);
+      if (expanded.has(aliasId)) continue;
+      expanded.set(aliasId, {
+        ...model,
+        id: aliasId,
+        name: `${model.name} (${effort})`,
+        supportsEffort: false,
+        effortMap: undefined,
+      });
+    }
+  }
+
+  return [...expanded.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
 function modelConfig(m: ProcessedModel) {
+  const input: ("text" | "image")[] = supportsVisionModelId(m.id) ? ["text", "image"] : ["text"];
   return {
     id: m.id,
     name: m.name,
     reasoning: supportsReasoningModelId(m.id),
-    input: ["text"] as ("text" | "image")[],
+    input,
     cost: estimateModelCost(m.id),
     contextWindow: m.contextWindow,
     maxTokens: m.maxTokens,
@@ -352,6 +389,11 @@ function modelConfig(m: ProcessedModel) {
       maxTokensField: "max_tokens" as const,
     },
   };
+}
+
+function supportsVisionModelId(id: string): boolean {
+  const normalized = id.toLowerCase();
+  return /^(claude|gemini|gpt|grok|kimi)(-|$)/.test(normalized);
 }
 
 
@@ -374,7 +416,18 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
   pi.on("session_before_switch", cleanupCurrentSession);
   pi.on("session_before_fork", cleanupCurrentSession);
   pi.on("session_before_tree", cleanupCurrentSession);
-  pi.on("session_shutdown", cleanupCurrentSession);
+  pi.on("session_shutdown", (event, ctx) => {
+    const reason = (event as { reason?: string } | undefined)?.reason;
+    debugExtensionLog("session.shutdown", {
+      reason,
+      sessionId: (ctx as { sessionManager?: { getSessionId?: () => string } })?.sessionManager?.getSessionId?.(),
+    });
+    if (reason !== "reload") {
+      cleanupCurrentSession(event, ctx as { sessionManager: { getSessionId(): string; getLeafId?: () => string } });
+    }
+    // Keep the HTTP proxy alive across extension reloads. Its state lives on globalThis,
+    // so the newly imported extension can reuse the same Cursor checkpoint and token hook.
+  });
 }
 
 function registerExtensionDebugHooks(pi: ExtensionAPI) {
@@ -495,11 +548,12 @@ export default async function (pi: ExtensionAPI) {
     const processed = skipDedup
       ? rawModels.map(m => ({ ...m, supportsEffort: false } as ProcessedModel))
       : processModels(rawModels);
+    const modelsForSelection = expandModelsForSelection(processed);
 
     pi.registerProvider("cursor", {
       baseUrl,
       api: "openai-completions",
-      models: processed.map(modelConfig),
+      models: modelsForSelection.map(modelConfig),
       oauth: {
         name: "Cursor",
 
