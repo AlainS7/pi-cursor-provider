@@ -20,6 +20,7 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 2. **Model discovery** — queries Cursor's `GetUsableModels` gRPC endpoint
 3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol
 4. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
+5. **Context injection** — forwards `AGENTS.md` / `SKILLS.md` guidance from project, user, and extension locations
 
 ## Install
 
@@ -82,6 +83,8 @@ pi selects: composer-2     +  (no effort)     →  Cursor receives: composer-2
 
 When a group is **collapsed**, the proxy registers one model with `supportsReasoningEffort: true` and an internal effort map (see table above).
 
+To make high/low/xhigh selection easier in pi's `/model` picker, the extension also registers fixed-effort aliases (for example `gpt-5.3-codex-high`, `gpt-5.3-codex-low`) alongside the collapsed base row.
+
 **Collapsed** when Cursor returns either:
 
 - **Multiple** effort suffixes for the same `(base, -fast, -thinking)` group, or
@@ -115,6 +118,25 @@ When Cursor pauses for a tool call, the proxy keeps the live upstream bridge ope
 ### Interruptions
 
 If the client disconnects or interrupts a turn mid-stream, the proxy cancels the upstream Cursor run and does **not** commit the pending checkpoint. Checkpoints are only committed after a turn finishes successfully.
+
+## Default context files
+
+On Cursor `requestContext` requests, the proxy includes guidance from available `AGENTS.md` and `SKILLS.md` files in:
+
+- Project: `./AGENTS.md`, `./.cursor/AGENTS.md`, `./.pi/AGENTS.md`, `./.pi/skills/SKILLS.md`, `./.pi/agent/skills/SKILLS.md`
+- User agent home: `~/.pi/AGENTS.md`, `~/.pi/agent/AGENTS.md`, `~/.pi/agent/skills/SKILLS.md`
+- Installed extensions: `*/AGENTS.md` and `*/skills/SKILLS.md` under both project and home extension directories
+
+Only existing, non-empty files up to 256KB are included.
+
+## Pi-injected context rules
+
+Besides filesystem context files, the proxy now parses Pi's injected system prompt sections and converts them into Cursor `requestContext.rules`:
+
+- `# Project Context` blocks are converted into **global** rules
+- `<available_skills>...</available_skills>` entries are converted into **agent-fetched** rules
+
+When these sections are extracted, they are removed from the system prompt body sent to Cursor to avoid duplicating the same context in two channels.
 
 ### Session fork
 
