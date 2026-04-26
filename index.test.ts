@@ -2,7 +2,10 @@ import rawModels from "./cursor-models-raw.json";
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
-import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
+import { buildEffortMap, expandModelsForSelection, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
 import {
   resolveModelId,
   __testInternals,
@@ -21,6 +24,10 @@ import {
 
   startProxy,
   stopProxy,
+  loadDefaultContextFilesForTests,
+  preparePromptContextForTests,
+  resetContextFileCacheForTests,
+  mergeContextFilesIntoRequestContextRules,
   writeSSEStreamForTests,
 } from "./proxy.ts";
 import type { CursorModel, ParsedTurn } from "./proxy.ts";
@@ -38,6 +45,7 @@ import {
   InteractionUpdateSchema,
   KvServerMessageSchema,
   McpArgsSchema,
+  RequestContextArgsSchema,
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
   UserMessageSchema,
@@ -45,6 +53,7 @@ import {
 
 afterEach(() => {
   stopProxy();
+  resetContextFileCacheForTests();
   setBridgeFactoryForTests();
   cleanupAllSessionState();
 });
@@ -68,6 +77,10 @@ describe("parseModelId", () => {
 
   test("model with effort suffix", () => {
     expect(parseModelId("gpt-5.4-medium")).toEqual({ base: "gpt-5.4", effort: "medium", fast: false, thinking: false });
+  });
+
+  test("med suffix normalizes to medium", () => {
+    expect(parseModelId("gpt-5.5-med")).toEqual({ base: "gpt-5.5", effort: "medium", fast: false, thinking: false });
   });
 
   test("model with effort + fast", () => {
@@ -206,6 +219,17 @@ describe("processModels", () => {
     expect(result[0].id).toBe("gpt-5.4");
     expect(result[0].supportsEffort).toBe(true);
     expect(result[0].effortMap!.medium).toBe("medium");
+    expect(result[0].effortMap!.xhigh).toBe("xhigh");
+  });
+
+  test("gpt-5.5 — deduped from low/medium/high/xhigh", () => {
+    const result = processModels([
+      m("gpt-5.5-low"), m("gpt-5.5-medium"), m("gpt-5.5-high"), m("gpt-5.5-xhigh"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("gpt-5.5");
+    expect(result[0].supportsEffort).toBe(true);
+    expect(result[0].effortMap!.low).toBe("low");
     expect(result[0].effortMap!.xhigh).toBe("xhigh");
   });
 
@@ -350,6 +374,10 @@ describe("processModels", () => {
     expect(gpt54).toBeDefined();
     expect(gpt54!.supportsEffort).toBe(true);
 
+    const gpt55 = result.find(r => r.id === "gpt-5.5");
+    expect(gpt55).toBeDefined();
+    expect(gpt55!.supportsEffort).toBe(true);
+
     // Opus should be deduped too
     const opus46 = result.find(r => r.id === "claude-4.6-opus");
     expect(opus46).toBeDefined();
@@ -361,6 +389,36 @@ describe("processModels", () => {
     expect(result.find(r => r.id === "gpt-5.4-medium")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.4-high")).toBeUndefined();
     expect(result.find(r => r.id === "gpt-5.2-low")).toBeUndefined();
+  });
+});
+
+describe("expandModelsForSelection", () => {
+  test("adds fixed-effort alias model IDs for deduped effort-capable models", () => {
+    const processed = processModels([
+      m("gpt-5.3-codex-low"),
+      m("gpt-5.3-codex-medium"),
+      m("gpt-5.3-codex-high"),
+      m("gpt-5.3-codex-xhigh"),
+    ]);
+    const expanded = expandModelsForSelection(processed);
+    const ids = new Set(expanded.map((model) => model.id));
+
+    expect(ids.has("gpt-5.3-codex")).toBe(true);
+    expect(ids.has("gpt-5.3-codex-high")).toBe(true);
+    expect(ids.has("gpt-5.3-codex-low")).toBe(true);
+    expect(ids.has("gpt-5.3-codex-xhigh")).toBe(true);
+  });
+
+  test("keeps aliases as fixed-effort rows (no extra reasoning-effort remap)", () => {
+    const processed = processModels([
+      m("gpt-5.4-low-fast"),
+      m("gpt-5.4-medium-fast"),
+      m("gpt-5.4-high-fast"),
+    ]);
+    const expanded = expandModelsForSelection(processed);
+    const highFast = expanded.find((model) => model.id === "gpt-5.4-high-fast");
+    expect(highFast).toBeTruthy();
+    expect(highFast!.supportsEffort).toBe(false);
   });
 });
 
@@ -377,6 +435,8 @@ describe("resolveModelId", () => {
     expect(resolveModelId("gpt-5.4", "medium")).toBe("gpt-5.4-medium");
     expect(resolveModelId("gpt-5.4", "high")).toBe("gpt-5.4-high");
     expect(resolveModelId("gpt-5.4", "xhigh")).toBe("gpt-5.4-xhigh");
+    expect(resolveModelId("gpt-5.5", "low")).toBe("gpt-5.5-low");
+    expect(resolveModelId("gpt-5.5", "med")).toBe("gpt-5.5-medium");
   });
 
   test("fast model + effort — inserts before -fast", () => {
@@ -400,6 +460,11 @@ describe("resolveModelId", () => {
 
   test("spark-preview model + effort", () => {
     expect(resolveModelId("gpt-5.3-codex-spark-preview", "xhigh")).toBe("gpt-5.3-codex-spark-preview-xhigh");
+  });
+
+  test("does not append effort twice when model already has effort", () => {
+    expect(resolveModelId("claude-4.6-opus-max", "xhigh")).toBe("claude-4.6-opus-max");
+    expect(resolveModelId("gpt-5.4-medium-fast", "high")).toBe("gpt-5.4-medium-fast");
   });
 });
 
@@ -524,7 +589,7 @@ describe("session cleanup", () => {
 });
 
 describe("session cleanup hook wiring", () => {
-  test("registerSessionLifecycleCleanup wires switch/fork/tree/shutdown to cleanup current session", async () => {
+  test("registerSessionLifecycleCleanup clears session state; session_shutdown never stops proxy", async () => {
     const handlers = new Map<string, Function>();
     const pi = {
       on(event: string, handler: Function) {
@@ -564,7 +629,7 @@ describe("session cleanup hook wiring", () => {
     });
 
     const ctx = { sessionManager: { getSessionId: () => sessionId } };
-    for (const event of ["session_before_switch", "session_before_fork", "session_before_tree", "session_shutdown"]) {
+    for (const event of ["session_before_switch", "session_before_fork", "session_before_tree"]) {
       __testInternals.activeBridges.set(bridgeKey, {
         bridge: {
           get alive() { return false; },
@@ -593,6 +658,152 @@ describe("session cleanup hook wiring", () => {
       expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
       expect(__testInternals.conversationStates.has(convKey)).toBe(false);
     }
+
+    const seed = () => {
+      __testInternals.activeBridges.set(bridgeKey, {
+        bridge: {
+          get alive() { return false; },
+          write() {},
+          end() {},
+          onData() {},
+          onClose() {},
+          proc: {} as any,
+        } as any,
+        heartbeatTimer,
+        blobStore: new Map(),
+        mcpTools: [],
+        pendingExecs: [],
+        currentTurn: turn("current"),
+      });
+      __testInternals.conversationStates.set(convKey, {
+        conversationId: "conv",
+        checkpoint: null,
+        sessionScoped: true,
+        blobStore: new Map(),
+        lastAccessMs: Date.now(),
+      });
+    };
+
+    seed();
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+
+    seed();
+    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+  });
+});
+
+describe("context file loading", () => {
+  test("loads project/home AGENTS and skills, including extension-provided context files", () => {
+    const originalCwd = process.cwd();
+    const originalHome = process.env.HOME;
+    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-project-"));
+    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-home-"));
+
+    try {
+      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "project agents", "utf8");
+      mkdirSync(pathJoin(projectDir, ".pi", "skills"), { recursive: true });
+      writeFileSync(pathJoin(projectDir, ".pi", "skills", "SKILLS.md"), "project skills", "utf8");
+
+      mkdirSync(pathJoin(homeDir, ".pi", "agent", "skills"), { recursive: true });
+      writeFileSync(pathJoin(homeDir, ".pi", "agent", "AGENTS.md"), "home agents", "utf8");
+      writeFileSync(pathJoin(homeDir, ".pi", "agent", "skills", "SKILLS.md"), "home skills", "utf8");
+
+      mkdirSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "skills"), { recursive: true });
+      writeFileSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "AGENTS.md"), "ext agents", "utf8");
+      writeFileSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "skills", "SKILLS.md"), "ext skills", "utf8");
+
+      process.chdir(projectDir);
+      process.env.HOME = homeDir;
+      resetContextFileCacheForTests();
+
+      const paths = new Set(loadDefaultContextFilesForTests().map((entry) => realpathSync(entry.path)));
+      expect(paths).toContain(realpathSync(pathJoin(projectDir, "AGENTS.md")));
+      expect(paths).toContain(realpathSync(pathJoin(projectDir, ".pi", "skills", "SKILLS.md")));
+      expect(paths).toContain(realpathSync(pathJoin(homeDir, ".pi", "agent", "AGENTS.md")));
+      expect(paths).toContain(realpathSync(pathJoin(homeDir, ".pi", "agent", "skills", "SKILLS.md")));
+      expect(paths).toContain(realpathSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "AGENTS.md")));
+      expect(paths).toContain(realpathSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "skills", "SKILLS.md")));
+    } finally {
+      process.chdir(originalCwd);
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  test("merges disk context files into requestContext rules (global)", () => {
+    const originalCwd = process.cwd();
+    const originalHome = process.env.HOME;
+    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-merge-rules-"));
+    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-merge-rules-home-"));
+
+    try {
+      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "merge-test-project-agents", "utf8");
+      mkdirSync(pathJoin(homeDir, ".pi", "agent"), { recursive: true });
+      writeFileSync(pathJoin(homeDir, ".pi", "agent", "AGENTS.md"), "merge-test-home-agents", "utf8");
+
+      process.chdir(projectDir);
+      process.env.HOME = homeDir;
+      resetContextFileCacheForTests();
+
+      const merged = mergeContextFilesIntoRequestContextRules([]);
+      const contents = merged.map((r) => r.content.trim());
+      expect(contents).toContain("merge-test-project-agents");
+      expect(contents).toContain("merge-test-home-agents");
+      for (const rule of merged) {
+        expect(rule.type?.type.case).toBe("global");
+      }
+    } finally {
+      process.chdir(originalCwd);
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("prompt-context rule extraction", () => {
+  test("parses # Project Context and <available_skills> into request-context rules", () => {
+    const systemPrompt = [
+      "You are Pi.",
+      "# Project Context",
+      "## /repo/AGENTS.md",
+      "Use batched tool calls.",
+      "",
+      "## /repo/skills/SKILLS.md",
+      "Prefer context7 for library docs.",
+      "",
+      "<available_skills>",
+      "<skill><name>context7-mcp</name><description>Docs tool</description><location>user</location></skill>",
+      "</available_skills>",
+      "Current date: 2026-04-24",
+    ].join("\n");
+
+    const prepared = preparePromptContextForTests(systemPrompt);
+
+    expect(prepared.rules.length).toBe(3);
+    const paths = prepared.rules.map((rule) => rule.fullPath);
+    expect(paths).toContain("/repo/AGENTS.md");
+    expect(paths).toContain("/repo/skills/SKILLS.md");
+    expect(paths).toContain("skill://context7-mcp");
+    expect(prepared.cleanedPrompt).toContain("You are Pi.");
+    expect(prepared.cleanedPrompt).toContain("Current date: 2026-04-24");
+    expect(prepared.cleanedPrompt).not.toContain("# Project Context");
+    expect(prepared.cleanedPrompt).not.toContain("<available_skills>");
+  });
+
+  test("keeps prompt unchanged when no parseable context sections exist", () => {
+    const systemPrompt = "You are Pi with no special sections.";
+    const prepared = preparePromptContextForTests(systemPrompt);
+
+    expect(prepared.rules).toHaveLength(0);
+    expect(prepared.cleanedPrompt).toBe(systemPrompt);
   });
 });
 
@@ -945,6 +1156,28 @@ describe("parseMessages — structured tool turns", () => {
     expect(parsed.userText).toBe("review it");
     expect(parsed.toolResults).toEqual([{ toolCallId: "t1", content: "pkg" }]);
   });
+
+  test("keeps image parts in user text instead of dropping them", () => {
+    const parsed = parseMessages([
+      { role: "user", content: [
+        { type: "text", text: "describe this image" },
+        { type: "image_url", image_url: { url: "https://example.com/cat.png", detail: "high" } },
+      ] as any },
+    ]);
+
+    expect(parsed.userText).toContain("describe this image");
+    expect(parsed.userText).toContain("https://example.com/cat.png");
+    expect(parsed.userText).toContain("detail=high");
+  });
+
+  test("summarizes data URL image parts to avoid huge base64 payloads", () => {
+    const dataUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA";
+    const parsed = parseMessages([
+      { role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] as any },
+    ]);
+
+    expect(parsed.userText).toContain("[image data attached: data:image/png;base64]");
+  });
 });
 
 function frameConnectMessageForTest(data: Uint8Array, flags = 0): Buffer {
@@ -1100,6 +1333,22 @@ function makeMcpExecMessage(toolCallId: string, toolName: string, args: Record<s
               Object.entries(args).map(([key, value]) => [key, new TextEncoder().encode(value)]),
             ),
           }),
+        },
+      }),
+    },
+  });
+}
+
+function makeRequestContextExecMessage() {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "execServerMessage",
+      value: create(ExecServerMessageSchema, {
+        id: 2,
+        execId: "exec-request-context",
+        message: {
+          case: "requestContextArgs",
+          value: create(RequestContextArgsSchema, {}),
         },
       }),
     },
@@ -1702,4 +1951,3 @@ describe("proxy integration — session handling", () => {
   });
 
 });
-
