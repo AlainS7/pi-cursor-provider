@@ -68,6 +68,7 @@ import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
   CursorRuleSchema,
+  CursorRuleSource,
   CursorRuleTypeSchema,
   CursorRuleTypeGlobalSchema,
   CursorRuleTypeAgentFetchedSchema,
@@ -698,10 +699,66 @@ function unescapeXml(value: string): string {
     .replace(/&apos;/g, "'");
 }
 
-function buildGlobalContextRule(path: string, content: string): CursorRule {
+function normalizeGitRemoteOrigin(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+
+  // Common formats:
+  // - git@github.com:owner/repo.git
+  // - https://github.com/owner/repo.git
+  // - ssh://git@github.com/owner/repo.git
+  let rest = trimmed;
+  if (rest.endsWith(".git")) rest = rest.slice(0, -4);
+
+  if (rest.startsWith("git@")) {
+    const at = rest.indexOf(":");
+    if (at < 0) return undefined;
+    const host = rest.slice("git@".length, at);
+    const path = rest.slice(at + 1);
+    if (!host || !path) return undefined;
+    return `${host}/${path}`;
+  }
+
+  try {
+    const url = new URL(rest);
+    const host = url.hostname;
+    const path = url.pathname.replace(/^\/+/, "");
+    if (!host || !path) return undefined;
+    return `${host}/${path}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function readGitRemoteOriginForFilePath(filePath: string): string | undefined {
+  // Best-effort: walk upwards from the file's directory looking for `.git/config`.
+  // This is intentionally conservative; failures simply omit gitRemoteOrigin.
+  let dir = dirname(filePath);
+  for (let i = 0; i < 12; i += 1) {
+    const gitConfigPath = pathJoin(dir, ".git", "config");
+    if (existsSync(gitConfigPath)) {
+      try {
+        const cfg = readFileSync(gitConfigPath, "utf8");
+        const m = cfg.match(/^\s*url\s*=\s*(.+)$/m);
+        if (!m?.[1]) return undefined;
+        return normalizeGitRemoteOrigin(m[1]);
+      } catch {
+        return undefined;
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+function buildGlobalContextRule(path: string, content: string, gitRemoteOrigin?: string): CursorRule {
   return create(CursorRuleSchema, {
     fullPath: path,
     content,
+    source: CursorRuleSource.USER,
+    ...(gitRemoteOrigin ? { gitRemoteOrigin } : {}),
     type: create(CursorRuleTypeSchema, {
       type: {
         case: "global",
@@ -717,6 +774,7 @@ function buildSkillContextRule(name: string, description: string, location: stri
   return create(CursorRuleSchema, {
     fullPath: syntheticPath,
     content,
+    source: CursorRuleSource.USER,
     type: create(CursorRuleTypeSchema, {
       type: {
         case: "agentFetched",
@@ -763,7 +821,9 @@ function preparePromptContext(systemPrompt: string): PreparedPromptContext {
       const rawPath = (match[1] ?? "").trim();
       const content = (match[2] ?? "").trim();
       if (!rawPath || !content) continue;
-      rules.push(buildGlobalContextRule(rawPath, content));
+      const resolvedPath = rawPath.startsWith("/") ? rawPath : pathResolve(process.cwd(), rawPath);
+      const origin = readGitRemoteOriginForFilePath(resolvedPath);
+      rules.push(buildGlobalContextRule(resolvedPath, content, origin));
     }
     if (rules.length > 0) {
       rangesToStrip.push({ start: projectStart, end: projectEnd });
@@ -1587,13 +1647,14 @@ function loadDefaultContextFiles(): ContextFileEntry[] {
   if (cachedContextFiles && cachedContextFilesKey === cacheKey) return cachedContextFiles;
 
   const home = process.env.HOME ?? "";
+  const includeHomeContext = process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT?.trim() !== "0";
   const candidates = new Set([
     pathResolve(process.cwd(), "AGENTS.md"),
     pathResolve(process.cwd(), ".cursor", "AGENTS.md"),
     pathResolve(process.cwd(), ".pi", "AGENTS.md"),
     pathResolve(process.cwd(), ".pi", "skills", "SKILLS.md"),
     pathResolve(process.cwd(), ".pi", "agent", "skills", "SKILLS.md"),
-    ...(home ? [
+    ...(home && includeHomeContext ? [
       pathResolve(home, ".pi", "AGENTS.md"),
       pathResolve(home, ".pi", "agent", "AGENTS.md"),
       pathResolve(home, ".pi", "agent", "skills", "SKILLS.md"),
@@ -1617,7 +1678,7 @@ function loadDefaultContextFiles(): ContextFileEntry[] {
 
   addExtensionContextCandidates(pathResolve(process.cwd(), ".pi", "extensions"));
   addExtensionContextCandidates(pathResolve(process.cwd(), ".pi", "agent", "extensions"));
-  if (home) addExtensionContextCandidates(pathResolve(home, ".pi", "agent", "extensions"));
+  if (home && includeHomeContext) addExtensionContextCandidates(pathResolve(home, ".pi", "agent", "extensions"));
 
   const files: ContextFileEntry[] = [];
   for (const candidate of candidates) {
@@ -1647,20 +1708,34 @@ export function mergeContextFilesIntoRequestContextRules(promptRules: CursorRule
   const contextFiles = loadDefaultContextFiles();
   if (contextFiles.length === 0) return promptRules;
 
-  const existingTrimmedContent = new Set(promptRules.map((r) => r.content.trim()));
-  const deduped = new Map<string, CursorRule>();
+  const dedupeIdenticalTrimmedContent = process.env.PI_CURSOR_DEDUPE_RULE_CONTENT?.trim() !== "0";
+
   const key = (r: CursorRule) => `${r.fullPath}\u0000${r.content}`;
-  for (const rule of promptRules) deduped.set(key(rule), rule);
+  const merged: CursorRule[] = [];
+  const dedupedByKey = new Map<string, CursorRule>();
+  const seenTrimmed = new Set<string>();
+
+  const pushRule = (rule: CursorRule) => {
+    const trimmed = rule.content.trim();
+    if (dedupeIdenticalTrimmedContent) {
+      if (seenTrimmed.has(trimmed)) return;
+      seenTrimmed.add(trimmed);
+    }
+
+    const k = key(rule);
+    if (dedupedByKey.has(k)) return;
+    dedupedByKey.set(k, rule);
+    merged.push(rule);
+  };
+
+  for (const rule of promptRules) pushRule(rule);
 
   for (const entry of contextFiles) {
-    const trimmed = entry.content.trim();
-    if (existingTrimmedContent.has(trimmed)) continue;
-    const rule = buildGlobalContextRule(entry.path, entry.content);
-    const k = key(rule);
-    if (!deduped.has(k)) deduped.set(k, rule);
+    const origin = readGitRemoteOriginForFilePath(entry.path);
+    pushRule(buildGlobalContextRule(entry.path, entry.content, origin));
   }
 
-  return [...deduped.values()];
+  return merged;
 }
 
 export function resetContextFileCacheForTests(): void {
