@@ -1,6 +1,9 @@
 import rawModels from "./cursor-models-raw.json";
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 import { request as httpRequest } from "node:http";
 import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
 import {
@@ -17,6 +20,9 @@ import {
   deterministicConversationId,
   buildCursorRequest,
   parseMessages,
+  preparePromptContextForTests,
+  mergeContextFilesIntoRequestContextRules,
+  resetContextFileCacheForTests,
   setBridgeFactoryForTests,
 
   startProxy,
@@ -35,6 +41,10 @@ import {
   ConversationTurnStructureSchema,
   ConversationStepSchema,
   ExecServerMessageSchema,
+  CursorRuleSchema,
+  CursorRuleSource,
+  CursorRuleTypeGlobalSchema,
+  CursorRuleTypeSchema,
   InteractionUpdateSchema,
   KvServerMessageSchema,
   McpArgsSchema,
@@ -43,10 +53,16 @@ import {
   UserMessageSchema,
 } from "./proto/agent_pb.ts";
 
+function restoreEnvVar(name: string, previous: string | undefined) {
+  if (previous === undefined) delete (process.env as any)[name];
+  else (process.env as any)[name] = previous;
+}
+
 afterEach(() => {
   stopProxy();
   setBridgeFactoryForTests();
   cleanupAllSessionState();
+  resetContextFileCacheForTests();
 });
 
 // ── Helper ──
@@ -54,6 +70,150 @@ afterEach(() => {
 function m(id: string, name?: string): CursorModel {
   return { id, name: name ?? id, reasoning: true, contextWindow: 200_000, maxTokens: 64_000 };
 }
+
+// ── Prompt context ──
+
+describe("prompt context extraction", () => {
+  test("extracts project context and available skills as user-sourced rules", () => {
+    const systemPrompt = [
+      "You are Pi.",
+      "# Project Context",
+      "## /repo/AGENTS.md",
+      "Use repo rules.",
+      "<available_skills>",
+      "<skill><name>find-docs</name><description>Fetch docs</description><location>user</location></skill>",
+      "</available_skills>",
+      "Current date: 2026-04-27",
+    ].join("\n");
+
+    const prepared = preparePromptContextForTests(systemPrompt);
+
+    expect(prepared.cleanedPrompt).not.toContain("# Project Context");
+    expect(prepared.cleanedPrompt).not.toContain("<available_skills>");
+    expect(prepared.rules).toHaveLength(2);
+    expect(prepared.rules.map((r) => r.source)).toEqual([CursorRuleSource.USER, CursorRuleSource.USER]);
+    expect(prepared.rules[0].fullPath).toBe("/repo/AGENTS.md");
+    expect(prepared.rules[0].type?.type.case).toBe("global");
+    expect(prepared.rules[1].fullPath).toBe("skill://find-docs");
+    expect(prepared.rules[1].type?.type.case).toBe("agentFetched");
+  });
+
+  test("dedupes identical context file content across project and home paths", () => {
+    const originalCwd = process.cwd();
+    const originalHome = process.env.HOME;
+    const originalIncludeHome = process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+    const originalDedupe = process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-project-"));
+    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-home-"));
+
+    try {
+      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "same guidance\n", "utf8");
+      const homeAgentDir = pathJoin(homeDir, ".pi", "agent");
+      mkdirSync(homeAgentDir, { recursive: true });
+      writeFileSync(pathJoin(homeAgentDir, "AGENTS.md"), "same guidance\n", { encoding: "utf8", flag: "w" });
+
+      process.chdir(projectDir);
+      process.env.HOME = homeDir;
+      delete process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+      delete process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+      resetContextFileCacheForTests();
+
+      const merged = mergeContextFilesIntoRequestContextRules([]);
+
+      expect(merged).toHaveLength(1);
+      expect(merged[0].content).toBe("same guidance");
+      expect(merged[0].source).toBe(CursorRuleSource.USER);
+    } finally {
+      process.chdir(originalCwd);
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      restoreEnvVar("PI_CURSOR_INCLUDE_HOME_CONTEXT", originalIncludeHome);
+      restoreEnvVar("PI_CURSOR_DEDUPE_RULE_CONTENT", originalDedupe);
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+      resetContextFileCacheForTests();
+    }
+  });
+
+  test("skips home context files when PI_CURSOR_INCLUDE_HOME_CONTEXT=0", () => {
+    const originalCwd = process.cwd();
+    const originalHome = process.env.HOME;
+    const originalIncludeHome = process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+    const originalDedupe = process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-project-"));
+    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-home-"));
+
+    try {
+      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "project guidance\n", "utf8");
+      const homeAgentDir = pathJoin(homeDir, ".pi", "agent");
+      mkdirSync(homeAgentDir, { recursive: true });
+      writeFileSync(pathJoin(homeAgentDir, "AGENTS.md"), "home guidance\n", { encoding: "utf8", flag: "w" });
+
+      process.chdir(projectDir);
+      process.env.HOME = homeDir;
+      process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT = "0";
+      delete process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+      resetContextFileCacheForTests();
+
+      const merged = mergeContextFilesIntoRequestContextRules([]);
+
+      expect(merged.map((r) => r.content)).toEqual(["project guidance"]);
+    } finally {
+      process.chdir(originalCwd);
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      restoreEnvVar("PI_CURSOR_INCLUDE_HOME_CONTEXT", originalIncludeHome);
+      restoreEnvVar("PI_CURSOR_DEDUPE_RULE_CONTENT", originalDedupe);
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+      resetContextFileCacheForTests();
+    }
+  });
+
+  test("dedupes identical trimmed content between prompt-derived rules and disk files", () => {
+    const originalCwd = process.cwd();
+    const originalHome = process.env.HOME;
+    const originalIncludeHome = process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+    const originalDedupe = process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-project-"));
+    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-home-"));
+
+    try {
+      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "same guidance\n", "utf8");
+
+      process.chdir(projectDir);
+      process.env.HOME = homeDir;
+      delete process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+      delete process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+      resetContextFileCacheForTests();
+
+      const promptRules = [
+        create(CursorRuleSchema, {
+          fullPath: "/repo/AGENTS.md",
+          content: "same guidance",
+          source: CursorRuleSource.USER,
+          type: create(CursorRuleTypeSchema, {
+            type: { case: "global", value: create(CursorRuleTypeGlobalSchema, {}) },
+          }),
+        }),
+      ];
+
+      const merged = mergeContextFilesIntoRequestContextRules(promptRules);
+
+      expect(merged).toHaveLength(1);
+      expect(merged[0].fullPath).toBe("/repo/AGENTS.md");
+    } finally {
+      process.chdir(originalCwd);
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      restoreEnvVar("PI_CURSOR_INCLUDE_HOME_CONTEXT", originalIncludeHome);
+      restoreEnvVar("PI_CURSOR_DEDUPE_RULE_CONTENT", originalDedupe);
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+      resetContextFileCacheForTests();
+    }
+  });
+});
 
 // ── parseModelId ──
 
