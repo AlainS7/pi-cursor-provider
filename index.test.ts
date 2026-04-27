@@ -1,6 +1,9 @@
 import rawModels from "./cursor-models-raw.json";
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 import { request as httpRequest } from "node:http";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,6 +23,9 @@ import {
   deterministicConversationId,
   buildCursorRequest,
   parseMessages,
+  preparePromptContextForTests,
+  mergeContextFilesIntoRequestContextRules,
+  resetContextFileCacheForTests,
   setBridgeFactoryForTests,
 
   startProxy,
@@ -42,6 +48,10 @@ import {
   ConversationTurnStructureSchema,
   ConversationStepSchema,
   ExecServerMessageSchema,
+  CursorRuleSchema,
+  CursorRuleSource,
+  CursorRuleTypeGlobalSchema,
+  CursorRuleTypeSchema,
   InteractionUpdateSchema,
   KvServerMessageSchema,
   McpArgsSchema,
@@ -51,11 +61,17 @@ import {
   UserMessageSchema,
 } from "./proto/agent_pb.ts";
 
+function restoreEnvVar(name: string, previous: string | undefined) {
+  if (previous === undefined) delete (process.env as any)[name];
+  else (process.env as any)[name] = previous;
+}
+
 afterEach(() => {
   stopProxy();
   resetContextFileCacheForTests();
   setBridgeFactoryForTests();
   cleanupAllSessionState();
+  resetContextFileCacheForTests();
 });
 
 // ── Helper ──
@@ -63,6 +79,150 @@ afterEach(() => {
 function m(id: string, name?: string): CursorModel {
   return { id, name: name ?? id, reasoning: true, contextWindow: 200_000, maxTokens: 64_000 };
 }
+
+// ── Prompt context ──
+
+describe("prompt context extraction", () => {
+  test("extracts project context and available skills as user-sourced rules", () => {
+    const systemPrompt = [
+      "You are Pi.",
+      "# Project Context",
+      "## /repo/AGENTS.md",
+      "Use repo rules.",
+      "<available_skills>",
+      "<skill><name>find-docs</name><description>Fetch docs</description><location>user</location></skill>",
+      "</available_skills>",
+      "Current date: 2026-04-27",
+    ].join("\n");
+
+    const prepared = preparePromptContextForTests(systemPrompt);
+
+    expect(prepared.cleanedPrompt).not.toContain("# Project Context");
+    expect(prepared.cleanedPrompt).not.toContain("<available_skills>");
+    expect(prepared.rules).toHaveLength(2);
+    expect(prepared.rules.map((r) => r.source)).toEqual([CursorRuleSource.USER, CursorRuleSource.USER]);
+    expect(prepared.rules[0].fullPath).toBe("/repo/AGENTS.md");
+    expect(prepared.rules[0].type?.type.case).toBe("global");
+    expect(prepared.rules[1].fullPath).toBe("skill://find-docs");
+    expect(prepared.rules[1].type?.type.case).toBe("agentFetched");
+  });
+
+  test("dedupes identical context file content across project and home paths", () => {
+    const originalCwd = process.cwd();
+    const originalHome = process.env.HOME;
+    const originalIncludeHome = process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+    const originalDedupe = process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-project-"));
+    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-home-"));
+
+    try {
+      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "same guidance\n", "utf8");
+      const homeAgentDir = pathJoin(homeDir, ".pi", "agent");
+      mkdirSync(homeAgentDir, { recursive: true });
+      writeFileSync(pathJoin(homeAgentDir, "AGENTS.md"), "same guidance\n", { encoding: "utf8", flag: "w" });
+
+      process.chdir(projectDir);
+      process.env.HOME = homeDir;
+      delete process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+      delete process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+      resetContextFileCacheForTests();
+
+      const merged = mergeContextFilesIntoRequestContextRules([]);
+
+      expect(merged).toHaveLength(1);
+      expect(merged[0].content).toBe("same guidance");
+      expect(merged[0].source).toBe(CursorRuleSource.USER);
+    } finally {
+      process.chdir(originalCwd);
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      restoreEnvVar("PI_CURSOR_INCLUDE_HOME_CONTEXT", originalIncludeHome);
+      restoreEnvVar("PI_CURSOR_DEDUPE_RULE_CONTENT", originalDedupe);
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+      resetContextFileCacheForTests();
+    }
+  });
+
+  test("skips home context files when PI_CURSOR_INCLUDE_HOME_CONTEXT=0", () => {
+    const originalCwd = process.cwd();
+    const originalHome = process.env.HOME;
+    const originalIncludeHome = process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+    const originalDedupe = process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-project-"));
+    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-home-"));
+
+    try {
+      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "project guidance\n", "utf8");
+      const homeAgentDir = pathJoin(homeDir, ".pi", "agent");
+      mkdirSync(homeAgentDir, { recursive: true });
+      writeFileSync(pathJoin(homeAgentDir, "AGENTS.md"), "home guidance\n", { encoding: "utf8", flag: "w" });
+
+      process.chdir(projectDir);
+      process.env.HOME = homeDir;
+      process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT = "0";
+      delete process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+      resetContextFileCacheForTests();
+
+      const merged = mergeContextFilesIntoRequestContextRules([]);
+
+      expect(merged.map((r) => r.content)).toEqual(["project guidance"]);
+    } finally {
+      process.chdir(originalCwd);
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      restoreEnvVar("PI_CURSOR_INCLUDE_HOME_CONTEXT", originalIncludeHome);
+      restoreEnvVar("PI_CURSOR_DEDUPE_RULE_CONTENT", originalDedupe);
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+      resetContextFileCacheForTests();
+    }
+  });
+
+  test("dedupes identical trimmed content between prompt-derived rules and disk files", () => {
+    const originalCwd = process.cwd();
+    const originalHome = process.env.HOME;
+    const originalIncludeHome = process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+    const originalDedupe = process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-project-"));
+    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-home-"));
+
+    try {
+      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "same guidance\n", "utf8");
+
+      process.chdir(projectDir);
+      process.env.HOME = homeDir;
+      delete process.env.PI_CURSOR_INCLUDE_HOME_CONTEXT;
+      delete process.env.PI_CURSOR_DEDUPE_RULE_CONTENT;
+      resetContextFileCacheForTests();
+
+      const promptRules = [
+        create(CursorRuleSchema, {
+          fullPath: "/repo/AGENTS.md",
+          content: "same guidance",
+          source: CursorRuleSource.USER,
+          type: create(CursorRuleTypeSchema, {
+            type: { case: "global", value: create(CursorRuleTypeGlobalSchema, {}) },
+          }),
+        }),
+      ];
+
+      const merged = mergeContextFilesIntoRequestContextRules(promptRules);
+
+      expect(merged).toHaveLength(1);
+      expect(merged[0].fullPath).toBe("/repo/AGENTS.md");
+    } finally {
+      process.chdir(originalCwd);
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      restoreEnvVar("PI_CURSOR_INCLUDE_HOME_CONTEXT", originalIncludeHome);
+      restoreEnvVar("PI_CURSOR_DEDUPE_RULE_CONTENT", originalDedupe);
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+      resetContextFileCacheForTests();
+    }
+  });
+});
 
 // ── parseModelId ──
 
@@ -589,7 +749,7 @@ describe("session cleanup", () => {
 });
 
 describe("session cleanup hook wiring", () => {
-  test("registerSessionLifecycleCleanup clears session state; session_shutdown never stops proxy", async () => {
+  test("registerSessionLifecycleCleanup cleans up on switch(new), fork, and tree", async () => {
     const handlers = new Map<string, Function>();
     const pi = {
       on(event: string, handler: Function) {
@@ -603,6 +763,66 @@ describe("session cleanup hook wiring", () => {
     const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
     const convKey = deriveConversationKeyFromSessionId(sessionId);
     const heartbeatTimer = setInterval(() => {}, 60_000);
+
+    const seed = () => {
+      __testInternals.activeBridges.set(bridgeKey, {
+        bridge: {
+          get alive() { return false; },
+          write() {},
+          end() {},
+          onData() {},
+          onClose() {},
+          proc: {} as any,
+        } as any,
+        heartbeatTimer,
+        blobStore: new Map(),
+        mcpTools: [],
+        pendingExecs: [],
+        currentTurn: turn("current"),
+      });
+      __testInternals.conversationStates.set(convKey, {
+        conversationId: "conv",
+        checkpoint: null,
+
+
+        sessionScoped: true,
+        blobStore: new Map(),
+        lastAccessMs: Date.now(),
+      });
+    };
+
+    const ctx = { sessionManager: { getSessionId: () => sessionId, getSessionFile: () => "/sessions/current.jsonl" } };
+
+    seed();
+    await handlers.get("session_before_switch")?.({ reason: "new" }, ctx);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+
+    for (const event of ["session_before_fork", "session_before_tree"]) {
+      seed();
+      await handlers.get(event)?.({}, ctx);
+      expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+      expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    }
+
+    clearInterval(heartbeatTimer);
+  });
+
+  test("registerSessionLifecycleCleanup does not clean up on session_shutdown (reload path)", async () => {
+    const handlers = new Map<string, Function>();
+    const pi = {
+      on(event: string, handler: Function) {
+        handlers.set(event, handler);
+      },
+    } as any;
+
+    registerSessionLifecycleCleanup(pi);
+
+    const sessionId = "session-hook-shutdown";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+
     __testInternals.activeBridges.set(bridgeKey, {
       bridge: {
         get alive() { return false; },
@@ -628,182 +848,108 @@ describe("session cleanup hook wiring", () => {
       lastAccessMs: Date.now(),
     });
 
-    const ctx = { sessionManager: { getSessionId: () => sessionId } };
-    for (const event of ["session_before_switch", "session_before_fork", "session_before_tree"]) {
-      __testInternals.activeBridges.set(bridgeKey, {
-        bridge: {
-          get alive() { return false; },
-          write() {},
-          end() {},
-          onData() {},
-          onClose() {},
-          proc: {} as any,
-        } as any,
-        heartbeatTimer,
-        blobStore: new Map(),
-        mcpTools: [],
-        pendingExecs: [],
-        currentTurn: turn("current"),
-      });
-      __testInternals.conversationStates.set(convKey, {
-        conversationId: "conv",
-        checkpoint: null,
-  
-  
-        sessionScoped: true,
-        blobStore: new Map(),
-        lastAccessMs: Date.now(),
-      });
-      await handlers.get(event)?.({}, ctx);
-      expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
-      expect(__testInternals.conversationStates.has(convKey)).toBe(false);
-    }
+    const ctx = { sessionManager: { getSessionId: () => sessionId, getSessionFile: () => "/sessions/current.jsonl" } };
+    await handlers.get("session_shutdown")?.({}, ctx);
 
-    const seed = () => {
-      __testInternals.activeBridges.set(bridgeKey, {
-        bridge: {
-          get alive() { return false; },
-          write() {},
-          end() {},
-          onData() {},
-          onClose() {},
-          proc: {} as any,
-        } as any,
-        heartbeatTimer,
-        blobStore: new Map(),
-        mcpTools: [],
-        pendingExecs: [],
-        currentTurn: turn("current"),
-      });
-      __testInternals.conversationStates.set(convKey, {
-        conversationId: "conv",
-        checkpoint: null,
-        sessionScoped: true,
-        blobStore: new Map(),
-        lastAccessMs: Date.now(),
-      });
-    };
-
-    seed();
-    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
     expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+    clearInterval(heartbeatTimer);
+  });
 
-    seed();
-    await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+  test("registerSessionLifecycleCleanup skips cleanup on resume to same session file", async () => {
+    const handlers = new Map<string, Function>();
+    const pi = {
+      on(event: string, handler: Function) {
+        handlers.set(event, handler);
+      },
+    } as any;
+
+    registerSessionLifecycleCleanup(pi);
+
+    const sessionId = "session-hook-same";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+
+    __testInternals.activeBridges.set(bridgeKey, {
+      bridge: {
+        get alive() { return false; },
+        write() {},
+        end() {},
+        onData() {},
+        onClose() {},
+        proc: {} as any,
+      } as any,
+      heartbeatTimer,
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: [],
+      currentTurn: turn("current"),
+    });
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv",
+      checkpoint: null,
+
+
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const ctx = { sessionManager: { getSessionId: () => sessionId, getSessionFile: () => "/sessions/current.jsonl" } };
+    await handlers.get("session_before_switch")?.({ reason: "resume", targetSessionFile: "/sessions/current.jsonl" }, ctx);
+
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+    clearInterval(heartbeatTimer);
+  });
+
+  test("registerSessionLifecycleCleanup cleans up on resume to different session file", async () => {
+    const handlers = new Map<string, Function>();
+    const pi = {
+      on(event: string, handler: Function) {
+        handlers.set(event, handler);
+      },
+    } as any;
+
+    registerSessionLifecycleCleanup(pi);
+
+    const sessionId = "session-hook-different";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+
+    __testInternals.activeBridges.set(bridgeKey, {
+      bridge: {
+        get alive() { return false; },
+        write() {},
+        end() {},
+        onData() {},
+        onClose() {},
+        proc: {} as any,
+      } as any,
+      heartbeatTimer,
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: [],
+      currentTurn: turn("current"),
+    });
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv",
+      checkpoint: null,
+
+
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const ctx = { sessionManager: { getSessionId: () => sessionId, getSessionFile: () => "/sessions/current.jsonl" } };
+    await handlers.get("session_before_switch")?.({ reason: "resume", targetSessionFile: "/sessions/other.jsonl" }, ctx);
+
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
     expect(__testInternals.conversationStates.has(convKey)).toBe(false);
-  });
-});
-
-describe("context file loading", () => {
-  test("loads project/home AGENTS and skills, including extension-provided context files", () => {
-    const originalCwd = process.cwd();
-    const originalHome = process.env.HOME;
-    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-project-"));
-    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-home-"));
-
-    try {
-      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "project agents", "utf8");
-      mkdirSync(pathJoin(projectDir, ".pi", "skills"), { recursive: true });
-      writeFileSync(pathJoin(projectDir, ".pi", "skills", "SKILLS.md"), "project skills", "utf8");
-
-      mkdirSync(pathJoin(homeDir, ".pi", "agent", "skills"), { recursive: true });
-      writeFileSync(pathJoin(homeDir, ".pi", "agent", "AGENTS.md"), "home agents", "utf8");
-      writeFileSync(pathJoin(homeDir, ".pi", "agent", "skills", "SKILLS.md"), "home skills", "utf8");
-
-      mkdirSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "skills"), { recursive: true });
-      writeFileSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "AGENTS.md"), "ext agents", "utf8");
-      writeFileSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "skills", "SKILLS.md"), "ext skills", "utf8");
-
-      process.chdir(projectDir);
-      process.env.HOME = homeDir;
-      resetContextFileCacheForTests();
-
-      const paths = new Set(loadDefaultContextFilesForTests().map((entry) => realpathSync(entry.path)));
-      expect(paths).toContain(realpathSync(pathJoin(projectDir, "AGENTS.md")));
-      expect(paths).toContain(realpathSync(pathJoin(projectDir, ".pi", "skills", "SKILLS.md")));
-      expect(paths).toContain(realpathSync(pathJoin(homeDir, ".pi", "agent", "AGENTS.md")));
-      expect(paths).toContain(realpathSync(pathJoin(homeDir, ".pi", "agent", "skills", "SKILLS.md")));
-      expect(paths).toContain(realpathSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "AGENTS.md")));
-      expect(paths).toContain(realpathSync(pathJoin(homeDir, ".pi", "agent", "extensions", "ext-a", "skills", "SKILLS.md")));
-    } finally {
-      process.chdir(originalCwd);
-      if (originalHome === undefined) delete process.env.HOME;
-      else process.env.HOME = originalHome;
-      rmSync(projectDir, { recursive: true, force: true });
-      rmSync(homeDir, { recursive: true, force: true });
-    }
-  });
-
-  test("merges disk context files into requestContext rules (global)", () => {
-    const originalCwd = process.cwd();
-    const originalHome = process.env.HOME;
-    const projectDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-merge-rules-"));
-    const homeDir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-merge-rules-home-"));
-
-    try {
-      writeFileSync(pathJoin(projectDir, "AGENTS.md"), "merge-test-project-agents", "utf8");
-      mkdirSync(pathJoin(homeDir, ".pi", "agent"), { recursive: true });
-      writeFileSync(pathJoin(homeDir, ".pi", "agent", "AGENTS.md"), "merge-test-home-agents", "utf8");
-
-      process.chdir(projectDir);
-      process.env.HOME = homeDir;
-      resetContextFileCacheForTests();
-
-      const merged = mergeContextFilesIntoRequestContextRules([]);
-      const contents = merged.map((r) => r.content.trim());
-      expect(contents).toContain("merge-test-project-agents");
-      expect(contents).toContain("merge-test-home-agents");
-      for (const rule of merged) {
-        expect(rule.type?.type.case).toBe("global");
-      }
-    } finally {
-      process.chdir(originalCwd);
-      if (originalHome === undefined) delete process.env.HOME;
-      else process.env.HOME = originalHome;
-      rmSync(projectDir, { recursive: true, force: true });
-      rmSync(homeDir, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("prompt-context rule extraction", () => {
-  test("parses # Project Context and <available_skills> into request-context rules", () => {
-    const systemPrompt = [
-      "You are Pi.",
-      "# Project Context",
-      "## /repo/AGENTS.md",
-      "Use batched tool calls.",
-      "",
-      "## /repo/skills/SKILLS.md",
-      "Prefer context7 for library docs.",
-      "",
-      "<available_skills>",
-      "<skill><name>context7-mcp</name><description>Docs tool</description><location>user</location></skill>",
-      "</available_skills>",
-      "Current date: 2026-04-24",
-    ].join("\n");
-
-    const prepared = preparePromptContextForTests(systemPrompt);
-
-    expect(prepared.rules.length).toBe(3);
-    const paths = prepared.rules.map((rule) => rule.fullPath);
-    expect(paths).toContain("/repo/AGENTS.md");
-    expect(paths).toContain("/repo/skills/SKILLS.md");
-    expect(paths).toContain("skill://context7-mcp");
-    expect(prepared.cleanedPrompt).toContain("You are Pi.");
-    expect(prepared.cleanedPrompt).toContain("Current date: 2026-04-24");
-    expect(prepared.cleanedPrompt).not.toContain("# Project Context");
-    expect(prepared.cleanedPrompt).not.toContain("<available_skills>");
-  });
-
-  test("keeps prompt unchanged when no parseable context sections exist", () => {
-    const systemPrompt = "You are Pi with no special sections.";
-    const prepared = preparePromptContextForTests(systemPrompt);
-
-    expect(prepared.rules).toHaveLength(0);
-    expect(prepared.cleanedPrompt).toBe(systemPrompt);
+    clearInterval(heartbeatTimer);
   });
 });
 

@@ -22,6 +22,25 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 4. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
 5. **Context injection** — forwards `AGENTS.md` / `SKILLS.md` guidance from project, user, and extension locations
 
+## Context injection (AGENTS / SKILLS) + privacy knobs
+
+The proxy merges local guidance into Cursor `requestContext` rules by scanning common locations:
+
+- Workspace: `./AGENTS.md`, `./.cursor/AGENTS.md`, `./.pi/AGENTS.md`, `./.pi/skills/SKILLS.md`, `./.pi/agent/skills/SKILLS.md`
+- Home (default on): `~/.pi/AGENTS.md`, `~/.pi/agent/AGENTS.md`, `~/.pi/agent/skills/SKILLS.md`, plus extension-provided `AGENTS.md` / `SKILLS.md` under `~/.pi/agent/extensions/*`
+
+**Home scanning opt-out** (workspace-only):
+
+```bash
+PI_CURSOR_INCLUDE_HOME_CONTEXT=0 pi
+```
+
+**Rule body dedupe** (drops later rules with identical trimmed `content`, including duplicates between prompt-derived rules and on-disk files):
+
+```bash
+PI_CURSOR_DEDUPE_RULE_CONTENT=0 pi
+```
+
 ## Install
 
 ```bash

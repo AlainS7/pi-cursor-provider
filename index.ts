@@ -13,11 +13,11 @@
  */
 
 import rawFallbackModels from "./cursor-models-raw.json";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, SessionBeforeSwitchEvent } from "@mariozechner/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
 import { appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join as pathJoin } from "node:path";
+import { join as pathJoin, resolve as pathResolve } from "node:path";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -413,21 +413,32 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
     cleanupSessionState(ctx.sessionManager.getSessionId());
   };
 
-  pi.on("session_before_switch", cleanupCurrentSession);
+  pi.on("session_before_switch", (event: SessionBeforeSwitchEvent, ctx: {
+    sessionManager: { getSessionId(): string; getLeafId?: () => string; getSessionFile?: () => string | undefined };
+  }) => {
+    const currentSessionFile = ctx.sessionManager.getSessionFile?.();
+    const targetSessionFile = event.targetSessionFile;
+    const shouldSkipCleanup =
+      event.reason === "resume"
+      && (
+        !targetSessionFile
+        || (currentSessionFile && pathResolve(currentSessionFile) === pathResolve(targetSessionFile))
+      );
+
+    debugExtensionLog("session.before_switch", {
+      sessionId: ctx.sessionManager.getSessionId(),
+      leafId: ctx.sessionManager.getLeafId?.(),
+      reason: event.reason,
+      currentSessionFile,
+      targetSessionFile,
+      skipCleanup: shouldSkipCleanup,
+    });
+
+    if (shouldSkipCleanup) return;
+    cleanupCurrentSession(event, ctx);
+  });
   pi.on("session_before_fork", cleanupCurrentSession);
   pi.on("session_before_tree", cleanupCurrentSession);
-  pi.on("session_shutdown", (event, ctx) => {
-    const reason = (event as { reason?: string } | undefined)?.reason;
-    debugExtensionLog("session.shutdown", {
-      reason,
-      sessionId: (ctx as { sessionManager?: { getSessionId?: () => string } })?.sessionManager?.getSessionId?.(),
-    });
-    if (reason !== "reload") {
-      cleanupCurrentSession(event, ctx as { sessionManager: { getSessionId(): string; getLeafId?: () => string } });
-    }
-    // Keep the HTTP proxy alive across extension reloads. Its state lives on globalThis,
-    // so the newly imported extension can reuse the same Cursor checkpoint and token hook.
-  });
 }
 
 function registerExtensionDebugHooks(pi: ExtensionAPI) {
