@@ -684,7 +684,7 @@ describe("session cleanup", () => {
 });
 
 describe("session cleanup hook wiring", () => {
-  test("registerSessionLifecycleCleanup wires switch/fork/tree/shutdown to cleanup current session", async () => {
+  test("registerSessionLifecycleCleanup cleans up on switch(new), fork, and tree", async () => {
     const handlers = new Map<string, Function>();
     const pi = {
       on(event: string, handler: Function) {
@@ -698,6 +698,66 @@ describe("session cleanup hook wiring", () => {
     const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
     const convKey = deriveConversationKeyFromSessionId(sessionId);
     const heartbeatTimer = setInterval(() => {}, 60_000);
+
+    const seed = () => {
+      __testInternals.activeBridges.set(bridgeKey, {
+        bridge: {
+          get alive() { return false; },
+          write() {},
+          end() {},
+          onData() {},
+          onClose() {},
+          proc: {} as any,
+        } as any,
+        heartbeatTimer,
+        blobStore: new Map(),
+        mcpTools: [],
+        pendingExecs: [],
+        currentTurn: turn("current"),
+      });
+      __testInternals.conversationStates.set(convKey, {
+        conversationId: "conv",
+        checkpoint: null,
+
+
+        sessionScoped: true,
+        blobStore: new Map(),
+        lastAccessMs: Date.now(),
+      });
+    };
+
+    const ctx = { sessionManager: { getSessionId: () => sessionId, getSessionFile: () => "/sessions/current.jsonl" } };
+
+    seed();
+    await handlers.get("session_before_switch")?.({ reason: "new" }, ctx);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+
+    for (const event of ["session_before_fork", "session_before_tree"]) {
+      seed();
+      await handlers.get(event)?.({}, ctx);
+      expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+      expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    }
+
+    clearInterval(heartbeatTimer);
+  });
+
+  test("registerSessionLifecycleCleanup does not clean up on session_shutdown (reload path)", async () => {
+    const handlers = new Map<string, Function>();
+    const pi = {
+      on(event: string, handler: Function) {
+        handlers.set(event, handler);
+      },
+    } as any;
+
+    registerSessionLifecycleCleanup(pi);
+
+    const sessionId = "session-hook-shutdown";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+
     __testInternals.activeBridges.set(bridgeKey, {
       bridge: {
         get alive() { return false; },
@@ -723,36 +783,108 @@ describe("session cleanup hook wiring", () => {
       lastAccessMs: Date.now(),
     });
 
-    const ctx = { sessionManager: { getSessionId: () => sessionId } };
-    for (const event of ["session_before_switch", "session_before_fork", "session_before_tree", "session_shutdown"]) {
-      __testInternals.activeBridges.set(bridgeKey, {
-        bridge: {
-          get alive() { return false; },
-          write() {},
-          end() {},
-          onData() {},
-          onClose() {},
-          proc: {} as any,
-        } as any,
-        heartbeatTimer,
-        blobStore: new Map(),
-        mcpTools: [],
-        pendingExecs: [],
-        currentTurn: turn("current"),
-      });
-      __testInternals.conversationStates.set(convKey, {
-        conversationId: "conv",
-        checkpoint: null,
-  
-  
-        sessionScoped: true,
-        blobStore: new Map(),
-        lastAccessMs: Date.now(),
-      });
-      await handlers.get(event)?.({}, ctx);
-      expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
-      expect(__testInternals.conversationStates.has(convKey)).toBe(false);
-    }
+    const ctx = { sessionManager: { getSessionId: () => sessionId, getSessionFile: () => "/sessions/current.jsonl" } };
+    await handlers.get("session_shutdown")?.({}, ctx);
+
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+    clearInterval(heartbeatTimer);
+  });
+
+  test("registerSessionLifecycleCleanup skips cleanup on resume to same session file", async () => {
+    const handlers = new Map<string, Function>();
+    const pi = {
+      on(event: string, handler: Function) {
+        handlers.set(event, handler);
+      },
+    } as any;
+
+    registerSessionLifecycleCleanup(pi);
+
+    const sessionId = "session-hook-same";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+
+    __testInternals.activeBridges.set(bridgeKey, {
+      bridge: {
+        get alive() { return false; },
+        write() {},
+        end() {},
+        onData() {},
+        onClose() {},
+        proc: {} as any,
+      } as any,
+      heartbeatTimer,
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: [],
+      currentTurn: turn("current"),
+    });
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv",
+      checkpoint: null,
+
+
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const ctx = { sessionManager: { getSessionId: () => sessionId, getSessionFile: () => "/sessions/current.jsonl" } };
+    await handlers.get("session_before_switch")?.({ reason: "resume", targetSessionFile: "/sessions/current.jsonl" }, ctx);
+
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+    clearInterval(heartbeatTimer);
+  });
+
+  test("registerSessionLifecycleCleanup cleans up on resume to different session file", async () => {
+    const handlers = new Map<string, Function>();
+    const pi = {
+      on(event: string, handler: Function) {
+        handlers.set(event, handler);
+      },
+    } as any;
+
+    registerSessionLifecycleCleanup(pi);
+
+    const sessionId = "session-hook-different";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const heartbeatTimer = setInterval(() => {}, 60_000);
+
+    __testInternals.activeBridges.set(bridgeKey, {
+      bridge: {
+        get alive() { return false; },
+        write() {},
+        end() {},
+        onData() {},
+        onClose() {},
+        proc: {} as any,
+      } as any,
+      heartbeatTimer,
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: [],
+      currentTurn: turn("current"),
+    });
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv",
+      checkpoint: null,
+
+
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+
+    const ctx = { sessionManager: { getSessionId: () => sessionId, getSessionFile: () => "/sessions/current.jsonl" } };
+    await handlers.get("session_before_switch")?.({ reason: "resume", targetSessionFile: "/sessions/other.jsonl" }, ctx);
+
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    clearInterval(heartbeatTimer);
   });
 });
 
